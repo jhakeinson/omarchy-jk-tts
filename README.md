@@ -1,6 +1,6 @@
 # Omarchy TTS
 
-[![CI](https://github.com/hikari112/omarchy-tts/actions/workflows/ci.yml/badge.svg)](https://github.com/hikari112/omarchy-tts/actions/workflows/ci.yml)
+[![CI](https://github.com/jhakeinson/omarchy-jk-tts/actions/workflows/ci.yml/badge.svg)](https://github.com/jhakeinson/omarchy-jk-tts/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Omarchy](https://img.shields.io/badge/Omarchy-Quattro-f97316.svg)](https://omarchy.org/)
 
@@ -43,7 +43,7 @@ navigation, control semantics, or Braille support.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/hikari112/omarchy-tts.git --enable
+omarchy plugin add https://github.com/jhakeinson/omarchy-jk-tts.git --enable
 ```
 
 Click the speaker in the bar. The welcome screen installs the recommended
@@ -390,7 +390,7 @@ For hot reload during development, clone the repository and symlink that clone
 to Omarchy's stable plugin location:
 
 ```bash
-git clone https://github.com/hikari112/omarchy-tts.git
+git clone https://github.com/jhakeinson/omarchy-jk-tts.git
 ln -s "$PWD/omarchy-tts" \
   "${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/io.github.hikari112.tts"
 ```

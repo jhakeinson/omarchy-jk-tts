@@ -5,6 +5,8 @@ Versioning.
 
 ## Unreleased
 
+## 1.4.1 - 2026-11-08
+
 - Fixed the panel rendering almost unreadable on themed machines: bare `Color`
   references in plugin QML resolve to QtQuick's built-in color helper object
   (`QQuickColor`) for files outside the shell's config folder, so every theme
@@ -16,6 +18,10 @@ Versioning.
   tabs, accents and body text now match the theme exactly.
 - Fixed the kokoro-onnx install flow dying with `curl: (23)` (the models
   directory was never created before curl staged its download).
+- Published as the standalone `jhakeinson/omarchy-jk-tts` repository, with
+  install and CI badge links pointed there. The plugin id
+  (`io.github.hikari112.tts`) is unchanged so existing installs keep their
+  configuration, engine directories and systemd unit names.
 
 ## 1.4.0 - 2026-11-08
 

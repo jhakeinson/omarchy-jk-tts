@@ -1,6 +1,6 @@
 # Security policy
 
-Please [report vulnerabilities privately](https://github.com/hikari112/omarchy-tts/security/advisories/new)
+Please [report vulnerabilities privately](https://github.com/jhakeinson/omarchy-jk-tts/security/advisories/new)
 through GitHub Security Advisories. Do not include API keys, selected text,
 clipboard contents, or screenshots in a report.
 
