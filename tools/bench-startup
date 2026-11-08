@@ -203,7 +203,7 @@ KOKORO_PY
   printf '  %-24s %8s s\n' 'exit ≥ done (teardown)' "$(awk -v w="$wall" -v d="$spawn_done" 'BEGIN { printf "%.3f", w - d }')"
 
   if [[ -z "$best_first" ]] || awk -v a="$spawn_first" -v b="$best_first" 'BEGIN { exit !(a < b) }'; then
-    best_first="$spawn_first"; best_done="$spawn_done"; best_wall="$wall"
+    best_first="$spawn_first"; best_done="$spawn_done"
   fi
   run=$((run + 1))
 }
@@ -211,7 +211,6 @@ KOKORO_PY
 chunks=0
 best_first=""
 best_done=""
-best_wall=""
 
 printf '== synthesis probes (voice %s, %s bytes, %s runs) ==\n' "$voice" "$(wc -c < "$text_file")" "$runs"
 run=1

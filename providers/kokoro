@@ -82,7 +82,7 @@ record_fingerprints() {
 record_dirty=0
 verified_files=()
 verify_model() { # <relative path>
-  local want got matched recorded_fp
+  local want got matched
   want="$(jq -r --arg f "$1" '.kokoro.files[$f].sha256 // empty' "$MANIFEST" 2>/dev/null)"
   [[ "$want" =~ ^[0-9a-f]{64}$ ]] || { echo "speak: kokoro: $1 is not a verified model file" >&2; exit 65; }
   [[ -f "$MODELS/$1" && ! -L "$MODELS/$1" ]] || { echo "speak: kokoro: $1 is missing; reinstall Kokoro from the Provider tab" >&2; exit 127; }
@@ -161,6 +161,8 @@ fi
 RATE="${TTS_RATE:-1.0}"
 TEXT_FILE="$(mktemp "${TMPDIR:-/tmp}/omarchy-tts-text.XXXXXXXX")"
 PCM_STAGE=""
+# Installed via trap, never called directly; shellcheck would flag SC2329.
+# shellcheck disable=SC2329
 rm_text() { rm -f -- "$TEXT_FILE" "$PCM_STAGE"; }
 trap rm_text EXIT
 cat > "$TEXT_FILE"

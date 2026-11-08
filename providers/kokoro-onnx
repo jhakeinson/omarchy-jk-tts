@@ -144,6 +144,8 @@ fi
 RATE="${TTS_RATE:-1.0}"
 TEXT_FILE="$(mktemp "${TMPDIR:-/tmp}/omarchy-tts-text.XXXXXXXX")"
 PCM_STAGE=""
+# Installed via trap, never called directly; shellcheck would flag SC2329.
+# shellcheck disable=SC2329
 rm_text() { rm -f -- "$TEXT_FILE" "$PCM_STAGE"; }
 trap rm_text EXIT
 cat > "$TEXT_FILE"
