@@ -5,6 +5,8 @@ Versioning.
 
 ## Unreleased
 
+## 1.4.2 - 2026-11-08
+
 - Rebranded the plugin id and QML module name to
   `io.github.jhakeinson.tts` for the standalone repository. A local install
   migrates by renaming its plugin directory; engines, voice packs and the
@@ -12,6 +14,13 @@ Versioning.
   nothing. The keybind bindings tool resolves the plugin through the stable
   `<PLUGIN_ID>` path constant, so managed launchers survive the rename
   wherever the directory is updated to the new id.
+- Made press verification and CI distro-portable after the standalone
+  repository's first Ubuntu runs: provider fingerprints are computed with
+  Python's exact integer `os.stat` instead of coreutils' float-formatting
+  `%.9Y` (which rounds differently under the Rust uutils coreutils and would
+  silently degrade a valid record to full digest re-reads), test stubs pick a
+  real distribution-owned helper path per host, and a few shellcheck findings
+  are cleared.
 
 ## 1.4.1 - 2026-11-08
 
