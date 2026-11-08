@@ -44,6 +44,21 @@ def load_setup_module():
     return module
 
 
+def stub_trusted_helper_path(setup):
+    """A distribution-installed real file to stand in for PKEXEC / PACMAN.
+
+    /usr/bin/env is only a reasonable stand-in where it is a regular file;
+    newer runner images symlink it, so take the first candidate that passes
+    the trusted-path rules on the machine running the tests."""
+    for candidate in ("/usr/bin/env", "/usr/bin/bash", "/usr/bin/true"):
+        try:
+            if setup.trusted_system_executable(Path(candidate)) == candidate:
+                return Path(candidate)
+        except RuntimeError:
+            continue
+    raise AssertionError("no distribution-installed executable found to stub")
+
+
 DAEMON = ROOT / "bin" / "speak-daemon"
 
 
@@ -1667,8 +1682,9 @@ class CliConfigTests(unittest.TestCase):
         installed = []
         setup.privileged_pacman = lambda *pkgs: installed.append(pkgs)
         setup.write_state = lambda *a, **k: None
-        setup.PKEXEC = Path("/usr/bin/env")
-        setup.PACMAN = Path("/usr/bin/env")
+        real = stub_trusted_helper_path(setup)
+        setup.PKEXEC = real
+        setup.PACMAN = real
         with self.assertRaisesRegex(RuntimeError, "could not be found"):
             setup.ensure_uv()
         self.assertEqual(installed, [("uv",)], "a missing uv is installed through the privileged path, never taken from PATH")
@@ -1720,7 +1736,7 @@ class CliConfigTests(unittest.TestCase):
     def test_language_install_goes_through_the_privileged_path_only(self):
         setup = load_setup_module()
         calls = []
-        setup.PKEXEC = Path("/usr/bin/env")
+        setup.PKEXEC = stub_trusted_helper_path(setup)
         setup.language_package = lambda code: f"tesseract-data-{code}"
         setup.privileged_pacman = lambda *pkgs: calls.append(pkgs)
         setup.write_state = lambda *a, **k: None
