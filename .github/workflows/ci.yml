@@ -17,6 +17,11 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      # Engine locks hash direct-URL wheels (12 MB+ spacy models from GitHub's
+      # release CDN); uv's short default per-request timeout made those
+      # downloads fail with "operation timed out" on slow links.
+      UV_HTTP_TIMEOUT: "300"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -127,6 +132,8 @@ jobs:
     name: Engine locks install for real
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    env:
+      UV_HTTP_TIMEOUT: "300"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
