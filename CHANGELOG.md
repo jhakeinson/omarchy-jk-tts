@@ -5,6 +5,18 @@ Versioning.
 
 ## Unreleased
 
+- Fixed the panel rendering almost unreadable on themed machines: bare `Color`
+  references in plugin QML resolve to QtQuick's built-in color helper object
+  (`QQuickColor`) for files outside the shell's config folder, so every theme
+  lookup (`Color.accent`, `Color.popups.*`, `Color.muted`, …) evaluated to
+  undefined and QML drew failed color bindings as black text on the dark
+  panel. All QML files now import the shell's `qs.Commons` singleton through
+  a qualified alias (`Commons.Color.*`), the same pattern Omarchy's own
+  third-party plugins use; verified against Catppuccin Mocha that headers,
+  tabs, accents and body text now match the theme exactly.
+- Fixed the kokoro-onnx install flow dying with `curl: (23)` (the models
+  directory was never created before curl staged its download).
+
 ## 1.4.0 - 2026-11-08
 
 - Cut the keypress → first-audio latency of the heavy local engines by more

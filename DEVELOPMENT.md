@@ -108,6 +108,15 @@ their output can change server-side under the same voice id.
 
 ## Deliberate design changes
 
+- Every QML file accesses the shell's theme singleton through a qualified
+  alias (`import qs.Commons as Commons` and `Commons.Color.*` / `Commons.Style`).
+  A bare `Color` is legal inside the shell's own config folder, but for plugin
+  files loaded from `~/.config/omarchy/plugins/` it resolves to QtQuick's
+  built-in color helper (`QQuickColor`), whose `accent` / `popups` members do
+  not exist; those bindings then fail and render black. Component subtrees
+  keep the unqualified import for `Style`/`Util` too where convenient, but all
+  color reads go through `Commons.Color`.
+
 - Screen remains a dedicated tab, with recognition languages separated into
   their own focused browser.
 - Keys use Omarchy's current Lua configuration, not the obsolete `.conf` file
