@@ -45,8 +45,20 @@ ENGINE_DIR="$(dirname "$MODELS")"
 RECORD="$ENGINE_DIR/.verified"
 [[ "$VOICE" =~ ^[a-z]{2}_[a-z]+$ ]] || { echo "speak: kokoro-onnx: invalid voice name" >&2; exit 65; }
 
-fingerprint() { # <file> — GNU stat's device, inode, size, nanosecond mtime
-  stat -Lc '%d:%i:%s:%.9Y' "$1" 2>/dev/null
+fingerprint() { # <file> — device, inode, size, nanosecond mtime as exact integers
+  # Python's os.stat is the same primitive the installer uses to publish the
+  # record, so the two sides agree by construction. GNU stat's %.9Y goes
+  # through floating point and other coreutils implementations (uutils) do
+  # too, which rounds differently and would make a valid record look stale.
+  python3 - "$1" <<'KOKORO_FINGERPRINT_PY' 2>/dev/null
+import os, sys
+try:
+    metadata = os.stat(sys.argv[1])
+    seconds, nanoseconds = divmod(metadata.st_mtime_ns, 1_000_000_000)
+    print(f"{metadata.st_dev}:{metadata.st_ino}:{metadata.st_size}:{seconds}.{nanoseconds:09d}")
+except OSError:
+    sys.exit(1)
+KOKORO_FINGERPRINT_PY
 }
 
 record_fingerprints() { # see providers/kokoro; never follow a symlink here

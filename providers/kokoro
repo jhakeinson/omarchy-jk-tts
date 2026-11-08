@@ -55,8 +55,20 @@ ENGINE_DIR="$(dirname "$MODELS")"
 RECORD="$ENGINE_DIR/.verified"
 [[ "$VOICE" =~ ^[a-z]{2}_[a-z]+$ ]] || { echo "speak: kokoro: invalid voice name" >&2; exit 65; }
 
-fingerprint() { # <file> — GNU stat's device, inode, size, nanosecond mtime
-  stat -Lc '%d:%i:%s:%.9Y' "$1" 2>/dev/null
+fingerprint() { # <file> — device, inode, size, nanosecond mtime as exact integers
+  # Python's os.stat agrees with the record publisher by construction; GNU
+  # stat's %.9Y and uutils both go through floating point and round
+  # differently, which would make a valid record look stale (see
+  # DEVELOPMENT.md for the runner failure that proved this).
+  python3 - "$1" <<'KOKORO_FINGERPRINT_PY' 2>/dev/null
+import os, sys
+try:
+    metadata = os.stat(sys.argv[1])
+    seconds, nanoseconds = divmod(metadata.st_mtime_ns, 1_000_000_000)
+    print(f"{metadata.st_dev}:{metadata.st_ino}:{metadata.st_size}:{seconds}.{nanoseconds:09d}")
+except OSError:
+    sys.exit(1)
+KOKORO_FINGERPRINT_PY
 }
 
 record_fingerprints() {

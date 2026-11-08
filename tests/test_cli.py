@@ -1897,8 +1897,19 @@ class CliConfigTests(unittest.TestCase):
         self.assertIn('PKEXEC = Path("/usr/bin/pkexec")', source)
         self.assertIn('PACMAN = Path("/usr/bin/pacman")', source)
         setup = load_setup_module()
-        # A distribution-installed executable passes.
-        self.assertEqual(setup.trusted_system_executable(Path("/usr/bin/env")), "/usr/bin/env")
+        # A distribution-installed executable passes. Not every distro keeps
+        # the same real files under /usr/bin (newer runner images ship /usr/bin/env
+        # as a symlink), so take the first candidate that satisfies the
+        # trusted-path rules on this machine.
+        real = None
+        for candidate in ("/usr/bin/env", "/usr/bin/bash", "/usr/bin/true"):
+            try:
+                if setup.trusted_system_executable(Path(candidate)) == candidate:
+                    real = Path(candidate)
+                    break
+            except RuntimeError:
+                continue
+        self.assertIsNotNone(real, "no real distribution executable found")
         # Anything under a user-writable tree is refused, however it is named.
         mine = Path(self.temp.name, "pacman")
         mine.write_text("#!/usr/bin/env bash\nexit 0\n")
@@ -1917,10 +1928,10 @@ class CliConfigTests(unittest.TestCase):
         # And the privileged call composes only from those checks.
         calls = []
         setup.run_checked = lambda argv, **kw: calls.append(argv)
-        setup.PKEXEC = Path("/usr/bin/env")
-        setup.PACMAN = Path("/usr/bin/env")
+        setup.PKEXEC = real
+        setup.PACMAN = real
         setup.privileged_pacman("uv")
-        self.assertEqual(calls, [["/usr/bin/env", "/usr/bin/env", "-S", "--noconfirm", "--needed", "uv"]])
+        self.assertEqual(calls, [[str(real), str(real), "-S", "--noconfirm", "--needed", "uv"]])
         setup.PACMAN = mine
         with self.assertRaises(RuntimeError):
             setup.privileged_pacman("uv")
