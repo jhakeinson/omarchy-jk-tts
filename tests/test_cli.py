@@ -1943,6 +1943,38 @@ class CliConfigTests(unittest.TestCase):
         setup.fetch_verified("https://example.invalid/model", dest, good, 4)
         self.assertEqual(dest.read_bytes(), b"good")
 
+    def test_fetch_verified_creates_a_missing_destination_directory(self):
+        # Preserve a one-line bug from 1.4.0 as a regression: curl was pointed
+        # at `<dest>.part` inside a directory the builder never created, so
+        # curl 8.x died with (23) "client returned ERROR on write of N bytes"
+        # and the whole engine transaction rolled back.
+        setup = load_setup_module()
+        served = Path(self.temp.name, "served.bin")
+        served.write_bytes(b"good")
+        setup.run_checked = lambda argv, **kw: shutil.copyfile(served, argv[-1])
+        dest = Path(self.temp.name, "fresh-dir", "model.onnx")
+        good = hashlib.sha256(b"good").hexdigest()
+        setup.fetch_verified("https://example.invalid/model", dest, good, 4)
+        self.assertEqual(dest.read_bytes(), b"good")
+
+    def test_kokoro_onnx_install_creates_its_models_directory(self):
+        setup = load_setup_module()
+        files = {
+            "kokoro-v1.0.onnx": {"url": "https://example.invalid/kokoro-v1.0.onnx",
+                                 "sha256": hashlib.sha256(b"m").hexdigest(), "size": 1},
+            "voices-v1.0.bin": {"url": "https://example.invalid/voices-v1.0.bin",
+                                "sha256": hashlib.sha256(b"v").hexdigest(), "size": 1},
+        }
+        setup.model_manifest = lambda: {"kokoro-onnx": {"files": files}}
+        setup.fetch_verified = lambda url, dest, sha, size: dest.write_text(sha)
+        # The verdict is recorded only after every file landed, so a passing
+        # hook proves the directory existed by then.
+        setup.record_model_verification = lambda engine, models: self.assertTrue(models.is_dir())
+        models = Path(self.temp.name, "onnx-models")
+        setup.install_kokoro_onnx_models(models)
+        self.assertEqual(sorted(p.name for p in models.iterdir()),
+                         ["kokoro-v1.0.onnx", "voices-v1.0.bin"])
+
     def test_engine_transaction_rolls_back_when_proof_fails(self):
         setup = load_setup_module()
         setup.ENGINE = Path(self.temp.name, "transaction-engines")

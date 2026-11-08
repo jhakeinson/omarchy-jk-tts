@@ -419,6 +419,7 @@ def fetch_verified(url: str, dest: Path, sha256: str, size: int) -> None:
         raise RuntimeError(f"Refusing artefact with an implausible size: {dest.name}")
     part = dest.with_name(dest.name + ".part")
     part.unlink(missing_ok=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
     try:
         run_checked(["curl", "-sSf", "--proto", "=https", "--proto-redir", "=https",
                      "--connect-timeout", "15", "--max-time", "1800",
@@ -487,6 +488,7 @@ def install_kokoro_onnx_models(models: Path) -> None:
     files = model_manifest().get("kokoro-onnx", {}).get("files", {})
     if not files:
         raise RuntimeError("The model manifest has no usable kokoro-onnx entry")
+    models.mkdir(parents=True, exist_ok=True)
     for path, entry in files.items():
         if not re.fullmatch(r"[A-Za-z0-9._-]+\.(onnx|bin)", path):
             raise RuntimeError(f"Refusing model file with an unexpected path: {path}")
@@ -632,7 +634,7 @@ def build_kokoro(target: Path) -> None:
 def build_kokoro_onnx(target: Path) -> None:
     uv = ensure_uv()
     write_state("running", "engine", 20,
-                "Installing the Kokoro (ONNX, int8) speech engine")
+                "Installing the Kokoro (ONNX) speech engine")
     target.parent.mkdir(parents=True, exist_ok=True)
     create_venv(uv, target, KOKORO_PYTHON)
     sync_locked(uv, str(target / "bin/python"), "kokoro-onnx")
