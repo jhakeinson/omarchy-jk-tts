@@ -10,6 +10,7 @@
 set -uo pipefail
 umask 077
 source "$TTS_PLUGIN_DIR/lib/play.sh"
+source "$TTS_PLUGIN_DIR/lib/cache.sh"
 
 # Bring your own interpreter: any python with `kokoro` importable.
 KPY="${KOKORO_PYTHON:-${TTS_DATA_DIR:-$HOME/.local/share/omarchy-tts}/engines/kokoro/bin/python}"
@@ -36,28 +37,220 @@ VOICE="${TTS_VOICE:-}"
 [[ -z "$VOICE" || "$VOICE" == "null" ]] && VOICE="af_heart"
 
 # The model, its config and the chosen voice are the files the installer
-# verified against lib/engines/models.json; check them again here, right
-# before they are loaded, and never let the hub client reach the network.
+# verified against lib/engines/models.json; they must look exactly as they
+# did then before they are loaded, and never let the hub client reach the
+# network.
+#
+# That verification is install-time work paid once, not per key press: the
+# installer digests every manifest file, then publishes each file's
+# fingerprint (device, inode, size, nanosecond mtime) in an owner-only
+# .verified record beside the models. A key press re-reads only stat. A
+# missing, stale or unreadable record is a signal, not a bypass: the full
+# sha256 verification runs for what it covers, and a pass republishes the
+# record for the next press. Tampering at runtime shows up as a fingerprint
+# mismatch the same way.
 MODELS="${KOKORO_MODELS:-${TTS_DATA_DIR:-$HOME/.local/share/omarchy-tts}/engines/kokoro/models}"
 MANIFEST="$TTS_PLUGIN_DIR/lib/engines/models.json"
+ENGINE_DIR="$(dirname "$MODELS")"
+RECORD="$ENGINE_DIR/.verified"
 [[ "$VOICE" =~ ^[a-z]{2}_[a-z]+$ ]] || { echo "speak: kokoro: invalid voice name" >&2; exit 65; }
+
+fingerprint() { # <file> — GNU stat's device, inode, size, nanosecond mtime
+  stat -Lc '%d:%i:%s:%.9Y' "$1" 2>/dev/null
+}
+
+record_fingerprints() {
+  # Never follow a symlink into an attacker-chosen record; a malformed,
+  # unreadable or missing record behaves the same way: nothing cheap could
+  # vouch for the files, so nothing cheap is trusted.
+  [[ -f "$RECORD" && ! -L "$RECORD" ]] || return 0
+  jq -r '.files | to_entries[] | "\(.key)\t\(.value.fingerprint)"' "$RECORD" 2>/dev/null || true
+}
+
+record_dirty=0
+verified_files=()
 verify_model() { # <relative path>
-  local want got
+  local want got matched recorded_fp
   want="$(jq -r --arg f "$1" '.kokoro.files[$f].sha256 // empty' "$MANIFEST" 2>/dev/null)"
   [[ "$want" =~ ^[0-9a-f]{64}$ ]] || { echo "speak: kokoro: $1 is not a verified model file" >&2; exit 65; }
   [[ -f "$MODELS/$1" && ! -L "$MODELS/$1" ]] || { echo "speak: kokoro: $1 is missing; reinstall Kokoro from the Provider tab" >&2; exit 127; }
-  got="$(sha256sum "$MODELS/$1" | cut -d' ' -f1)"
+  matched=""
+  while IFS=$'\t' read -r recorded name_fp; do
+    if [[ "$recorded" == "$1" && "$name_fp" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]+\.[0-9]{9}$ ]]; then
+      matched="$name_fp"
+    fi
+  done < <(record_fingerprints)
+  if [[ -n "$matched" && "$matched" == "$(fingerprint "$MODELS/$1")" ]]; then
+    return 0
+  fi
+  record_dirty=1
+  got="$(sha256sum "$MODELS/$1" 2>/dev/null | cut -d' ' -f1)"
   [[ "$got" == "$want" ]] || { echo "speak: kokoro: $1 failed verification; reinstall Kokoro from the Provider tab" >&2; exit 65; }
+  verified_files+=("$1")
 }
+
+refresh_verification_record() {
+  # Best effort, never fatal: republishing warms the next press; failing can
+  # not fail the synthesis whose files just verified. The names are those the
+  # manifest pinned and this press fully re-digested.
+  local tmp
+  tmp="$(mktemp "$ENGINE_DIR/.verified.tmp.XXXXXX")" || return 0
+  MODELS="$MODELS" MANIFEST="$MANIFEST" RECORD="$RECORD" DEST="$tmp" KOKORO_VERIFIED="$(printf '%s\n' "${verified_files[@]}")" \
+    python3 - <<'KOKORO_RECORD_PY' >/dev/null 2>&1 || { rm -f "$tmp"; return 0; }
+import json, os, re, sys
+try:
+    with open(os.environ["MANIFEST"], encoding="utf-8") as source:
+        manifest = json.load(source)["kokoro"]["files"]
+    keep = {}
+    record = os.environ["RECORD"]
+    if os.path.isfile(record) and not os.path.islink(record) and os.stat(record).st_uid == os.getuid():
+        with open(record, encoding="utf-8") as source:
+            existing = json.load(source)
+        if isinstance(existing, dict) and existing.get("version") == 1 and isinstance(existing.get("files"), dict):
+            keep = existing["files"]
+    names = [name for name in os.environ["KOKORO_VERIFIED"].split("\n") if name]
+    refreshed = {}
+    for name in names:
+        if not re.fullmatch(r"[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*\.(json|pth|pt)", name):
+            raise ValueError(name)
+        digest = manifest[name]["sha256"]
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError(name)
+        metadata = os.stat(os.path.join(os.environ["MODELS"], name))
+        if metadata.st_uid != os.getuid():
+            raise ValueError(name)
+        seconds, nanoseconds = divmod(metadata.st_mtime_ns, 1_000_000_000)
+        refreshed[name] = {"sha256": digest,
+                           "fingerprint": f"{metadata.st_dev}:{metadata.st_ino}:{metadata.st_size}:{seconds}.{nanoseconds:09d}"}
+    out = {"version": 1, "files": {**keep, **refreshed}}
+    descriptor = os.open(os.environ["DEST"], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(descriptor, (json.dumps(out, sort_keys=True) + "\n").encode())
+    finally:
+        os.close(descriptor)
+except Exception:
+    sys.exit(1)
+KOKORO_RECORD_PY
+  [[ -s "$tmp" ]] || { rm -f "$tmp"; return 0; }
+  chmod 600 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+  mv -f "$tmp" "$RECORD" 2>/dev/null || rm -f "$tmp"
+}
+
 verify_model config.json
 verify_model kokoro-v1_0.pth
 verify_model "voices/$VOICE.pt"
+if [[ "$record_dirty" == 1 && "${#verified_files[@]}" -gt 0 ]]; then
+  refresh_verification_record
+fi
+
+# The synthesis inputs are now fully pinned: engine verified, voice and speed
+# known. Read the text once so cache keying and every synthesis path below
+# see the identical bytes.
+RATE="${TTS_RATE:-1.0}"
+TEXT_FILE="$(mktemp "${TMPDIR:-/tmp}/omarchy-tts-text.XXXXXXXX")"
+PCM_STAGE=""
+rm_text() { rm -f -- "$TEXT_FILE" "$PCM_STAGE"; }
+trap rm_text EXIT
+cat > "$TEXT_FILE"
+
+CK=""
+if audio_cache_enabled; then
+  CK="$(audio_cache_key kokoro "$VOICE" "$RATE" < "$TEXT_FILE")"
+  if CACHED="$(audio_cache_lookup kokoro "$CK")"; then
+    rm -f -- "$TEXT_FILE"
+    # play_raw takes over this process (it execs the player), so the trap is
+    # moot here: everything was removed above by hand.
+    play_raw 24000 1 < "$CACHED"
+  fi
+  PCM_STAGE="$(audio_cache_stage kokoro "$CK")"
+fi
+
+# A resident daemon can already hold this engine loaded, so a press only
+# streams one request over a private socket instead of booting torch. The
+# full verification above runs first either way: the daemon serves exactly
+# these files, and it re-checks its install fingerprint per request. Any
+# failure before the first audio byte - missing socket, refused request,
+# non-answer - falls through to the inline synthesis below, so nothing
+# behaviour-visible depends on the daemon running.
+daemon_socket() { # <unit-name> — where the daemon or systemd listens
+  if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+    printf '%s/omarchy-tts/%s.sock' "$XDG_RUNTIME_DIR" "$1"
+  else
+    printf '%s/omarchy-tts/run/%s.sock' "${XDG_STATE_HOME:-$HOME/.local/state}" "$1"
+  fi
+}
+
+try_daemon() { # try_daemon <unit-name> — 3 means "not served, fall back"
+  [[ "${TTS_DAEMON:-1}" == "1" ]] || return 3
+  # A hand-supplied interpreter belongs to --verify and experiments: the
+  # daemon serves only what this release installed, so never divert to it.
+  [[ -z "${KOKORO_PYTHON:-}" ]] || return 3
+  local sock header
+  sock="$(daemon_socket "$1")"
+  [[ -S "$sock" ]] || return 3
+  header="$(jq -cRs --arg voice "$VOICE" --arg speed "$RATE" \
+               '{voice:$voice, speed:($speed|tonumber), text:.}' < "$TEXT_FILE")" || return 3
+  [[ "$header" == '{'* ]] || return 3
+  HEADER_JSON="$header" SOCK_PATH="$sock" python3 - <<'DAEMON_CLIENT_PY'
+import os, socket, sys
+try:
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(30.0)
+    sock.connect(os.environ["SOCK_PATH"])
+    sock.sendall(os.environ["HEADER_JSON"].encode() + b"\n")
+except OSError:
+    sys.exit(3)  # not served: the inline path still runs
+total = 0
+try:
+    while True:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        total += len(chunk)
+        sys.stdout.buffer.write(chunk)
+except OSError:
+    pass  # the press was interrupted; the daemon learns from the broken pipe
+try:
+    sys.stdout.buffer.flush()
+except OSError:
+    pass
+# An empty reply means the daemon refused the request: fall back and let the
+# inline path produce the real voice/speed error instead of guessing here.
+sys.exit(0 if total else 3)
+DAEMON_CLIENT_PY
+}
+
+# The inline synthesis stage: tee into the cache stage when caching, else
+# pass bytes through untouched.
+inline_stage() {
+  if [[ -n "$PCM_STAGE" ]]; then
+    tee -- "$PCM_STAGE"
+  else
+    cat
+  fi
+}
+
+if [[ -n "$PCM_STAGE" ]]; then
+  if try_daemon kokoro | tee -- "$PCM_STAGE" | play_raw 24000 1; then
+    # Served completely: the staged bytes become the cache entry. A
+    # cancelled or failed press never gets here, so nothing partial is
+    # remembered.
+    audio_cache_commit kokoro "$CK" "$PCM_STAGE"
+    exit 0
+  fi
+  # Not served, or the press died partway: fall through to the inline path,
+  # whose own tee truncates the stage fresh.
+else
+  if try_daemon kokoro | play_raw 24000 1; then
+    exit 0
+  fi
+fi
 
 # Torch is chatty on stderr on every run; none of it is actionable here, and
 # it buries real errors.
-KOKORO_VOICE="$VOICE" KOKORO_SPEED="${TTS_RATE:-1.0}" KOKORO_MODELS="$MODELS" \
+KOKORO_VOICE="$VOICE" KOKORO_SPEED="$RATE" KOKORO_MODELS="$MODELS" \
 PYTHONWARNINGS=ignore HF_HUB_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1 \
-"$KPY" 3<&0 - <<'KOKORO_PY' 2>/dev/null | play_raw 24000 1
+"$KPY" 3<"$TEXT_FILE" - <<'KOKORO_PY' 2>/dev/null | inline_stage | play_raw 24000 1
 import os, sys, warnings
 warnings.filterwarnings("ignore")
 import numpy as np
@@ -84,3 +277,9 @@ for _, _, audio in pipe(text, voice=pack,
     sys.stdout.buffer.write((samples * 32767.0).astype("<i2").tobytes())
     sys.stdout.buffer.flush()
 KOKORO_PY
+inline_rc=$?
+# A clean inline synthesis is just as cacheable as a daemon answer.
+if (( inline_rc == 0 )) && [[ -n "$PCM_STAGE" ]]; then
+  audio_cache_commit kokoro "$CK" "$PCM_STAGE"
+fi
+exit "$inline_rc"

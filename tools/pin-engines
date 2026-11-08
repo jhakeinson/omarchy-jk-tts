@@ -27,7 +27,7 @@ case "${1:-}" in
     # lib/engines/wheels is a flat index of reviewed wheels for dependencies
     # that publish none; with --only-binary it is the only candidate uv can
     # take, so the lock records the reviewed wheel's hash and nothing else.
-    for engine in piper kokoro easyocr; do
+    for engine in piper kokoro kokoro-onnx easyocr; do
       uv pip compile --quiet --generate-hashes --only-binary :all: --python-version 3.12 \
         --find-links "$spec/wheels" \
         --python-platform x86_64-unknown-linux-gnu --no-header --no-annotate \
@@ -57,6 +57,12 @@ case "${1:-}" in
       fetch "https://huggingface.co/$repo/resolve/$rev/$path?download=true" "$work/f" "$size"
       [[ "$(sha256sum "$work/f" | cut -d' ' -f1)" == "$sum" ]] || { echo "MODEL DIGEST CHANGED: kokoro $path" >&2; exit 1; }
       echo "kokoro $path ok"
+    done
+    jq -r '.["kokoro-onnx"].files | to_entries[] | "\(.key)\t\(.value.url)\t\(.value.sha256)\t\(.value.size)"' "$spec/models.json" |
+    while IFS=$'\t' read -r name url sum size; do
+      fetch "$url" "$work/f" "$size"
+      [[ "$(sha256sum "$work/f" | cut -d' ' -f1)" == "$sum" ]] || { echo "MODEL DIGEST CHANGED: kokoro-onnx $name" >&2; exit 1; }
+      echo "kokoro-onnx $name ok"
     done ;;
   *) echo "usage: $0 lock|models" >&2; exit 64 ;;
 esac

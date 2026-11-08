@@ -56,7 +56,7 @@ ENGINE_SPECS = PLUGIN / "lib" / "engines"
 # build backend uv resolves unhashed from the index. Such packages are
 # instead shipped as reviewed wheels under lib/engines/wheels, built
 # reproducibly from the hash-verified sdist (see DEVELOPMENT.md).
-ENGINE_LOCKS = {name: ENGINE_SPECS / f"{name}.lock" for name in ("piper", "kokoro", "easyocr")}
+ENGINE_LOCKS = {name: ENGINE_SPECS / f"{name}.lock" for name in ("piper", "kokoro", "kokoro-onnx", "easyocr")}
 MODEL_MANIFEST = ENGINE_SPECS / "models.json"
 LOCK_STAMP = ".lock-sha256"
 ENGINE_PYTHON = "3.12"
@@ -478,6 +478,54 @@ def install_kokoro_models(models: Path) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
         fetch_verified(f"https://huggingface.co/{repo}/resolve/{revision}/{path}?download=true",
                        dest, entry["sha256"], entry["size"])
+    record_model_verification("kokoro", models)
+
+
+def install_kokoro_onnx_models(models: Path) -> None:
+    """Fetch the quantized Kokoro graph and its voice-pack from the pinned
+    upstream release, each verified against its shipped digest."""
+    files = model_manifest().get("kokoro-onnx", {}).get("files", {})
+    if not files:
+        raise RuntimeError("The model manifest has no usable kokoro-onnx entry")
+    for path, entry in files.items():
+        if not re.fullmatch(r"[A-Za-z0-9._-]+\.(onnx|bin)", path):
+            raise RuntimeError(f"Refusing model file with an unexpected path: {path}")
+        fetch_verified(entry.get("url", ""), models / path, entry["sha256"], entry["size"])
+    record_model_verification("kokoro-onnx", models)
+
+
+def record_model_verification(engine: str, models: Path) -> None:
+    """The install already proved every manifest file against its shipped
+    digest. Publish that verdict beside the models: one owner-only record per
+    file of its digest and a stat fingerprint, so providers can refuse
+    tampered files with a fetch-free comparison instead of re-reading whole
+    hundreds of megabytes on every synthesis. A fingerprint that no longer
+    matches makes the full digest verification happen again at runtime."""
+    files = model_manifest().get(engine, {}).get("files", {})
+    if not files:
+        raise RuntimeError(f"The model manifest has no usable {engine} entry")
+    record = {"version": 1, "files": {}}
+    for path, entry in sorted(files.items()):
+        if not re.fullmatch(r"[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*\.(json|pth|pt|onnx|bin)", path):
+            raise RuntimeError(f"Refusing model file with an unexpected path: {path}")
+        target = models / path
+        if target.is_symlink() or not target.is_file():
+            raise RuntimeError(f"Missing or unsafe model file at verification: {path}")
+        digest = entry.get("sha256", "")
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise RuntimeError(f"The model manifest has no digest for {path}")
+        metadata = target.stat()
+        seconds, nanoseconds = divmod(metadata.st_mtime_ns, 1_000_000_000)
+        record["files"][path] = {
+            "sha256": digest,
+            "fingerprint": f"{metadata.st_dev}:{metadata.st_ino}:{metadata.st_size}:{seconds}.{nanoseconds:09d}",
+        }
+    # Atomic, mode 600 via umask: a torn or world-readable verdict is no verdict.
+    models.parent.mkdir(parents=True, exist_ok=True)
+    staged = models.parent / ".verified.part"
+    staged.write_text(json.dumps(record, sort_keys=True) + "\n")
+    staged.chmod(0o600)
+    staged.replace(models.parent / ".verified")
 
 
 def create_venv(uv: str, target: Path, python_version: str | None = None) -> None:
@@ -579,6 +627,18 @@ def build_kokoro(target: Path) -> None:
     sync_locked(uv, str(target / "bin/python"), "kokoro")
     write_state("running", "engine", 60, "Downloading and verifying the Kokoro model and voices")
     install_kokoro_models(target / "models")
+
+
+def build_kokoro_onnx(target: Path) -> None:
+    uv = ensure_uv()
+    write_state("running", "engine", 20,
+                "Installing the Kokoro (ONNX, int8) speech engine")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    create_venv(uv, target, KOKORO_PYTHON)
+    sync_locked(uv, str(target / "bin/python"), "kokoro-onnx")
+    write_state("running", "engine", 60,
+                "Downloading and verifying the Kokoro ONNX model and voices")
+    install_kokoro_onnx_models(target / "models")
 
 
 
@@ -761,6 +821,82 @@ def install_engine_transaction(name: str, builder, *, after_activate=None) -> No
         recover_engine_transaction(name)
 
 
+DAEMON_ENGINES = ("kokoro", "kokoro-onnx")
+
+
+def exec_start_path(path: Path) -> str:
+    """Quote a path for a systemd ExecStart= argument. ExecStart re-parses a
+    shell-like grammar, so anything with spaces or $#;{} needs quoting."""
+    if re.search(r"""[ \t"'$#{}*?~%\\]""", str(path)):
+        return '"' + str(path).replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return str(path)
+
+
+def install_daemon_units(engine: str) -> None:
+    """Publish the systemd user units that keep one resident synthesis daemon
+    per heavy engine attached to a private listening socket, then try to
+    start the listener. Best effort and silent on failure: the daemon is a
+    latency optimization, never a dependency — the providers fall back to
+    inline synthesis whenever the socket is absent."""
+    if engine not in DAEMON_ENGINES:
+        raise RuntimeError(f"No resident daemon for engine: {engine}")
+    python = ENGINE / engine / "bin/python"
+    if not python.is_file():
+        return  # engine vanished again meanwhile: units would point nowhere
+    directory = CONFIG_HOME / "systemd" / "user"
+    if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+        raise RuntimeError(f"Refusing systemd unit directory: {directory}")
+    socket_unit = f"omarchy-tts-{engine}.socket"
+    service_unit = f"omarchy-tts-{engine}.service"
+    units = {
+        socket_unit: f"""\
+[Unit]
+Description=Speak TTS resident synthesis socket ({engine})
+
+[Socket]
+ListenStream=%t/omarchy-tts/{engine}.sock
+SocketMode=0600
+DirectoryMode=0700
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target
+""",
+        service_unit: f"""\
+[Unit]
+Description=Speak TTS resident synthesis daemon ({engine})
+# The daemon is a latency optimization, never a dependency: if it crashes
+# repeatedly (broken engine, refused request), keep trying without a start
+# limit so the next press brings it back - a press either gets served or
+# falls back to inline synthesis, never dead-ends.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart={exec_start_path(python)} {exec_start_path(PLUGIN / "bin" / "speak-daemon")} --engine {engine}
+Restart=no
+PrivateTmp=true
+NoNewPrivileges=true
+Environment=PYTHONWARNINGS=ignore
+Environment=HF_HUB_OFFLINE=1
+Environment=HF_HUB_DISABLE_TELEMETRY=1
+""",
+    }
+    directory.mkdir(parents=True, exist_ok=True)
+    for name, content in units.items():
+        staged = directory / f".{name}.part"
+        staged.write_text(content)
+        os.chmod(staged, 0o644)
+        staged.replace(directory / name)
+    # The unit index must know the new units before they can be enabled.
+    for command in (["systemctl", "--user", "daemon-reload"],
+                    ["systemctl", "--user", "enable", "--now", socket_unit]):
+        try:
+            subprocess.run(command, capture_output=True, timeout=30, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            return
+
+
 def worker(target: str) -> int:
     global JOB_PID, JOB_IDENTITY, JOB_TARGET
     try:
@@ -785,6 +921,10 @@ def worker(target: str) -> int:
                                            after_activate=install_voice)
             elif target == "kokoro":
                 install_engine_transaction("kokoro", build_kokoro)
+                install_daemon_units("kokoro")
+            elif target == "kokoro-onnx":
+                install_engine_transaction("kokoro-onnx", build_kokoro_onnx)
+                install_daemon_units("kokoro-onnx")
             elif target == "easyocr":
                 install_engine_transaction("easyocr", build_easyocr)
             elif target.startswith(LANGUAGE_PREFIX):
@@ -816,7 +956,7 @@ def start(target: str) -> None:
         except RuntimeError as exc:
             emit(ok=False, code="unknown_target", message=str(exc))
             return
-    elif target not in {"recommended", "piper", "kokoro", *OCR_ENGINES}:
+    elif target not in {"recommended", "piper", "kokoro", "kokoro-onnx", *OCR_ENGINES}:
         emit(ok=False, code="unknown_target", message="Unknown installation target")
         return
     try:

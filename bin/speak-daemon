@@ -1,0 +1,559 @@
+#!/usr/bin/env python3
+"""Resident synthesis daemon for the heavy local TTS engines.
+
+One process per engine keeps the model resident across key presses. A press
+connects to a private unix socket, sends one JSON request line
+
+    {"voice": "af_heart", "speed": 1.0, "text": "..."}
+
+and streams the reply: raw s16le PCM at 24 kHz mono until the daemon closes
+the connection, which is exactly the provider contract the inline path
+speaks. The daemon is a latency optimization only, never a dependency: the
+providers fall back to inline synthesis whenever the socket is missing,
+stale, or refuses a request before the first audio byte.
+
+Security posture:
+
+- The socket lives under XDG_RUNTIME_DIR (or an owner-only XDG_STATE_HOME
+  fallback when no session runtime dir exists) in a 0700 directory, mode
+  0600; a symlinked socket path is refused, never followed.
+- Only the owner's uid may talk to it (SO_PEERCRED on every connection).
+- Requests are bounded: at most 1 MiB of JSON and 200 000 characters of
+  text; the speed must be a finite number.
+- The engine installation is fingerprinted (stat, never digest-sized reads)
+  when the model loads and re-checked on every request. A replaced or
+  tampered install ends the daemon so the socket unit starts a fresh one —
+  or the press falls back to inline synthesis against freshly verified
+  files — and nothing synthesized ever outlives its verification.
+- Under systemd the engine's socket unit owns the listener and starts the
+  daemon per demand (LISTEN_FDS); it self-exits after --idle-exit seconds
+  of silence, and the unit brings it back on the next press.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import os
+import queue
+import re
+import selectors
+import signal
+import socket
+import stat
+import struct
+import sys
+import threading
+import time
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+PLUGIN = Path(__file__).resolve().parents[1]
+
+SAMPLE_RATE = 24000
+CHANNELS = 1
+MAX_HEADER = 1 << 20
+MAX_TEXT = 200_000
+VOICE_RE = re.compile(r"[a-z]{2}_[a-z]+")
+
+LOG = logging.getLogger("speak-daemon")
+
+
+class RequestError(Exception):
+    """The connection asked for something no verified engine would say."""
+
+
+class EngineChanged(Exception):
+    """The engine installation no longer matches what this daemon loaded."""
+
+
+class StopServe(Exception):
+    """Raised by signal handlers so syscalls do not retry past a stop."""
+
+
+def data_dir() -> Path:
+    """Where managed engines live; same precedence the providers use."""
+    override = os.environ.get("TTS_DATA_DIR")
+    if override:
+        return Path(override)
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return Path(base) / "omarchy-tts"
+
+
+def runtime_dir() -> Path:
+    """Private, owner-only directory for the listening sockets. Prefer the
+    session runtime dir; without one, fall back to XDG_STATE_HOME so nothing
+    ever lands in shared /tmp."""
+    override = os.environ.get("XDG_RUNTIME_DIR")
+    if override:
+        return Path(override) / "omarchy-tts"
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return Path(base) / "omarchy-tts" / "run"
+
+
+def state_dir() -> Path:
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return Path(base) / "omarchy-tts"
+
+
+def fingerprint(path: Path) -> str:
+    """Same per-file fingerprint the installer publishes and the providers
+    compare: device, inode, size, nanosecond mtime. A stat, not a read."""
+    metadata = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
+        raise EngineChanged(path)
+    seconds, nanoseconds = divmod(metadata.st_mtime_ns, 1_000_000_000)
+    return f"{metadata.st_dev}:{metadata.st_ino}:{metadata.st_size}:{seconds}.{nanoseconds:09d}"
+
+
+def prepare_private_dir(directory: Path) -> None:
+    """Create or adopt an owner-only directory. Never follow a symlink into
+    it, and never leave it group- or world-traversable."""
+    if directory.is_symlink():
+        raise RuntimeError(f"refusing symlinked directory: {directory}")
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    info = directory.stat()
+    if info.st_uid != os.getuid():
+        raise RuntimeError(f"refusing foreign-owned directory: {directory}")
+    if info.st_mode & 0o077:
+        os.chmod(directory, 0o700)
+
+
+def peer_uid(connection: socket.socket) -> int | None:
+    """Credentials of the process on the other end, via the kernel."""
+    try:
+        pid, uid, _ = struct.unpack("3i", connection.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+    except OSError:
+        return None
+    return uid
+
+
+def read_request(connection: socket.socket) -> dict:
+    """One JSON line, bounded. Raises RequestError on anything malformed so
+    the caller closes without ever synthesizing."""
+    reader = connection.makefile("rb")
+    line = reader.readline(MAX_HEADER + 1)
+    if len(line) > MAX_HEADER:
+        raise RequestError("request header exceeds 1 MiB")
+    if not line or not line.endswith(b"\n"):
+        raise RequestError("request header is not a single line")
+    try:
+        request = json.loads(line.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RequestError(f"request is not valid JSON: {exc}") from exc
+    if not isinstance(request, dict):
+        raise RequestError("request must be a JSON object")
+    voice = request.get("voice")
+    text = request.get("text")
+    speed = request.get("speed", 1.0)
+    if not isinstance(voice, str) or not VOICE_RE.fullmatch(voice):
+        raise RequestError("request has no usable voice")
+    if not isinstance(text, str) or not text.strip():
+        raise RequestError("request has no text")
+    if len(text) > MAX_TEXT:
+        raise RequestError(f"text exceeds {MAX_TEXT} characters")
+    if isinstance(speed, bool) or not isinstance(speed, (int, float)) \
+            or speed != speed:  # NaN is never a speed
+        raise RequestError("speed must be a number")
+    speed = float(speed)
+    if speed <= 0.0 or speed != speed or speed in (float("inf"), float("-inf")):
+        raise RequestError("speed must be a finite positive number")
+    return {"text": text, "voice": voice, "speed": speed}
+
+
+def to_pcm16(audio) -> bytes:
+    """Share the providers' exact output shape: clipped float32 to little
+    endian s16le, mono, at the engine's sample rate."""
+    import numpy as np
+    samples = np.clip(np.asarray(audio, dtype="float32"), -1.0, 1.0)
+    return (samples * 32767.0).astype("<i2").tobytes()
+
+
+class TorchKokoro:
+    """The PyTorch engine: KModel/KPipeline loaded once, voice packs cached,
+    language picked from the voice prefix exactly as providers/kokoro does."""
+
+    MODEL = "kokoro-v1_0.pth"
+    PIN_FILES = ("config.json", "kokoro-v1_0.pth")
+
+    def __init__(self, models: Path):
+        self.models = models
+        self._ready = False
+        self._pins: list[tuple[Path, str]] = []
+        self._packs: dict[str, object] = {}
+        self._pipes: dict[str, object] = {}
+
+    def _load(self) -> None:
+        if self._ready:
+            return
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+        import numpy as np
+        import torch
+        from kokoro import KModel, KPipeline
+        self.np = np
+        self.torch = torch
+        self._KPipeline = KPipeline
+        # Local, verified files only: no repo lookup, no hub download.
+        self.model = KModel(repo_id="hexgrad/Kokoro-82M",
+                            config=str(self.models / "config.json"),
+                            model=str(self.models / self.MODEL)).eval()
+        self._pins = [(self.models / name, fingerprint(self.models / name))
+                      for name in self.PIN_FILES]
+        self._ready = True
+
+    def check_pins(self) -> None:
+        if self._ready:
+            for path, pin in self._pins:
+                if fingerprint(path) != pin:
+                    raise EngineChanged(f"engine install changed under the daemon: {path}")
+
+    def warm(self, voice: str) -> None:
+        self._load()
+        pack = self.torch.load(self.models / "voices" / f"{voice}.pt",
+                               weights_only=True)
+        self._packs[voice] = pack
+        # KPipeline is bound to one language; cache one pipeline per initial.
+        self._pipes.setdefault(voice[0], self._KPipeline(
+            lang_code=voice[0], repo_id="hexgrad/Kokoro-82M", model=self.model))
+
+    def synthesize(self, text: str, voice: str, speed: float, cancelled: threading.Event):
+        self.check_pins()
+        if not (self.models / "voices" / f"{voice}.pt").is_file():
+            raise RequestError(f"unknown voice {voice}")
+        self.warm(voice)
+        pack = self._packs[voice]
+        pipe = self._pipes[voice[0]]
+        for _, _, audio in pipe(text, voice=pack, speed=speed):
+            if cancelled.is_set():
+                break
+            if hasattr(audio, "detach"):
+                audio = audio.detach().cpu().numpy()
+            yield to_pcm16(audio)
+
+
+class OnnxKokoro:
+    """The fp32 ONNX engine: one session resident, batches synthesized in a
+    worker thread so a cancelled press never blocks the next one."""
+
+    MODEL = "kokoro-v1.0.onnx"
+    PIN_FILES = ("kokoro-v1.0.onnx", "voices-v1.0.bin")
+    LANG_BY_PREFIX = {"a": "en-us", "b": "en-gb", "e": "es", "f": "fr-fr",
+                      "h": "hi", "i": "it", "j": "ja", "p": "pt-br", "z": "zh"}
+
+    def __init__(self, models: Path):
+        self.models = models
+        self._ready = False
+        self._pins: list[tuple[Path, str]] = []
+
+    def _load(self) -> None:
+        if self._ready:
+            return
+        from kokoro_onnx import Kokoro
+        self.synth = Kokoro(str(self.models / self.MODEL),
+                            str(self.models / "voices-v1.0.bin"))
+        self.voices = self.synth.get_voices()
+        self._pins = [(self.models / name, fingerprint(self.models / name))
+                      for name in self.PIN_FILES]
+        self._ready = True
+
+    def check_pins(self) -> None:
+        if self._ready:
+            for path, pin in self._pins:
+                if fingerprint(path) != pin:
+                    raise EngineChanged(f"engine install changed under the daemon: {path}")
+
+    def synthesize(self, text: str, voice: str, speed: float, cancelled: threading.Event):
+        self.check_pins()
+        self._load()
+        if voice not in self.voices:
+            raise RequestError(f"unknown voice {voice}")
+        lang = self.LANG_BY_PREFIX.get(voice[0])
+        if lang is None:
+            raise RequestError(f"unknown voice language for {voice}")
+
+        chunks: queue.Queue = queue.Queue(maxsize=8)
+        END = object()
+
+        def produce() -> None:
+            async def run() -> None:
+                async def speak() -> None:
+                    async for samples, _rate in self.synth.create_stream(
+                            text, voice=voice, speed=speed, lang=lang):
+                        if cancelled.is_set():
+                            return
+                        chunk = to_pcm16(samples)
+                        # Backpressure with an exit: a vanished reader stops the
+                        # worker instead of parking it on a full queue forever.
+                        while not cancelled.is_set():
+                            try:
+                                chunks.put(chunk, timeout=0.25)
+                                break
+                            except queue.Full:
+                                continue
+                await speak()
+            try:
+                asyncio.run(run())
+            except Exception:
+                LOG.exception("synthesis failed")
+            finally:
+                chunks.put(END)
+
+        thread = threading.Thread(target=produce, name="onnx-synthesis",
+                                  daemon=True)
+        thread.start()
+        while True:
+            item = chunks.get()
+            if item is END:
+                break
+            yield item
+            if cancelled.is_set():
+                thread.join(timeout=30.0)
+                break
+
+
+class TestBackend:
+    """A stand-in synthesis source, for tests only. The file must define
+    synthesize(text, voice, speed, cancelled) returning an iterable of PCM
+    byte chunks; nothing about the managed engines is loaded or checked."""
+
+    MODEL = None
+    PIN_FILES = ()
+
+    def __init__(self, source: Path):
+        import importlib.machinery
+        import importlib.util
+        name = f"_speak_daemon_test_backend_{time.time_ns()}"
+        loader = importlib.machinery.SourceFileLoader(name, str(source))
+        spec = importlib.util.spec_from_loader(name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        if not callable(getattr(module, "synthesize", None)):
+            raise RuntimeError(f"{source} defines no synthesize(text, voice, speed, cancelled)")
+        self.synthesize = module.synthesize
+
+    def check_pins(self) -> None:  # nothing pinned: always current
+        return None
+
+
+def make_backend(engine: str, test_backend: str | None) -> object:
+    if test_backend:
+        return TestBackend(Path(test_backend))
+    models = data_dir() / "engines" / engine / "models"
+    if engine == "kokoro":
+        return TorchKokoro(models)
+    if engine == "kokoro-onnx":
+        return OnnxKokoro(models)
+    raise RuntimeError(f"no resident daemon for engine {engine}")
+
+
+def open_private_socket(path: Path) -> socket.socket:
+    """Bind the listening socket ourselves: stale leftovers are cleared only
+    when nothing live still serves them, and a live daemon is an error, not a
+    takeover."""
+    prepare_private_dir(path.parent)
+    if path.is_symlink():
+        raise RuntimeError(f"refusing symlinked socket path: {path}")
+    if path.exists() or path.is_socket():
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(0.5)
+        try:
+            probe.connect(str(path))
+        except OSError:
+            path.unlink()
+        else:
+            probe.close()
+            raise RuntimeError(f"another daemon is serving {path}")
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(path))
+    os.chmod(path, 0o600)
+    server.listen(16)
+    return server
+
+
+def listen_fds_ready() -> bool:
+    """Cheap env-only check for systemd socket activation: the daemon is the
+    process systemd launched (LISTEN_PID) and was handed at least one fd."""
+    try:
+        return (int(os.environ.get("LISTEN_PID", "")) == os.getpid()
+                and int(os.environ.get("LISTEN_FDS", "0")) >= 1)
+    except ValueError:
+        return False
+
+
+def take_activated_socket() -> socket.socket | None:
+    """systemd hands the listener over on fd 3 when the engine's socket unit
+    starts this daemon on demand. Wrap the fd exactly once; it must survive
+    for the life of the server loop."""
+    if not listen_fds_ready():
+        return None
+    return socket.socket(fileno=3)
+
+
+def handle_request(connection: socket.socket, backend) -> None:
+    """Serve one press. The connection is always closed on return, whatever
+    the outcome; the daemon never reads twice and never synthesizes for a
+    foreign uid."""
+    try:
+        uid = peer_uid(connection)
+        if uid != os.getuid():
+            LOG.warning("refused connection from uid %s", uid)
+            return
+        try:
+            request = read_request(connection)
+        except RequestError as exc:
+            LOG.info("refused request: %s", exc)
+            return
+        text, voice, speed = request["text"], request["voice"], request["speed"]
+        cancelled = threading.Event()
+        started = time.monotonic()
+        sent = 0
+        first = None
+        try:
+            backend.check_pins()
+            for chunk in backend.synthesize(text, voice, speed, cancelled):
+                try:
+                    connection.sendall(chunk)
+                except OSError:
+                    cancelled.set()
+                    break
+                if first is None:
+                    first = time.monotonic() - started
+                sent += len(chunk)
+        except RequestError as exc:
+            LOG.info("refused request (voice=%s): %s", voice, exc)
+        except EngineChanged as exc:
+            # The installation changed under the daemon. Refuse this request
+            # (the provider falls back to inline) and end the daemon so the
+            # next press starts against freshly verified files.
+            LOG.error("%s", exc)
+            raise
+        except Exception:
+            LOG.exception("synthesis failed (voice=%s)", voice)
+        if sent or cancelled.is_set():
+            LOG.info("served voice=%s speed=%.2f bytes=%d first=%.3fs total=%.3fs waited=%s",
+                     voice, speed, sent, first if first is not None else -1.0,
+                     time.monotonic() - started, bool(cancelled.is_set()))
+    except EngineChanged:
+        raise
+    finally:
+        try:
+            connection.close()
+        except OSError:
+            pass
+
+
+def setup_logging() -> None:
+    try:
+        prepare_private_dir(state_dir())
+        handler = RotatingFileHandler(state_dir() / "daemon.log",
+                                      maxBytes=256 * 1024, backupCount=2)
+        logging.basicConfig(level=logging.INFO,
+                            format="%(asctime)s %(levelname)s %(message)s",
+                            handlers=[handler])
+    except OSError:
+        logging.basicConfig(level=logging.INFO,
+                            format="%(asctime)s %(levelname)s %(message)s")
+
+
+def serve(engine: str, socket_path: Path | None, idle_exit: float,
+          test_backend: str | None) -> int:
+    setup_logging()
+    backend = make_backend(engine, test_backend)
+    if socket_path is not None:
+        server = open_private_socket(socket_path)
+    else:
+        server = take_activated_socket()
+    if server is None:
+        LOG.error("no listening socket configured (no socket-activation fd)")
+        return 1
+    LOG.info("resident daemon ready: engine=%s socket=%s idle_exit=%.0fs",
+             engine, socket_path or "systemd-provided", idle_exit)
+
+    running = threading.Event()
+    running.set()
+
+    def stop(_signum, _frame) -> None:
+        # Raising (not just setting a flag) is what makes a blocked
+        # select() return promptly instead of being retried by PEP 475.
+        running.clear()
+        raise StopServe
+
+    # When serve() runs on a non-main thread (tests), the process's own
+    # signals are simply not ours to redirect.
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
+
+    watcher = selectors.DefaultSelector()
+    watcher.register(server, selectors.EVENT_READ)
+    deadline = time.monotonic() + idle_exit
+    try:
+        while running.is_set():
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                LOG.info("idle exit")
+                break
+            for key, _ in watcher.select(timeout):
+                try:
+                    connection, _ = server.accept()
+                except OSError:
+                    continue
+                try:
+                    handle_request(connection, backend)
+                except EngineChanged:
+                    # Stop serving immediately; the next press restarts
+                    # against the freshly installed (and verified) files.
+                    LOG.error("ending daemon: engine installation changed")
+                    running.clear()
+                    break
+                deadline = time.monotonic() + idle_exit
+    except StopServe:
+        pass
+    try:
+        watcher.close()
+        server.close()
+        # Leave nothing behind that a stale listener probe would need to
+        # clean up. Only our own bound socket: never follow a symlink.
+        if socket_path is not None and socket_path.is_socket() \
+                and not socket_path.is_symlink():
+            socket_path.unlink()
+    except OSError:
+        pass
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    os.umask(0o077)
+    parser = argparse.ArgumentParser(
+        prog="speak-daemon",
+        description="Resident synthesis daemon for the heavy local engines.")
+    parser.add_argument("--engine", required=True, choices=("kokoro", "kokoro-onnx"))
+    parser.add_argument("--idle-exit", type=float, default=600.0, metavar="SECONDS")
+    parser.add_argument("--socket", type=Path, default=None, metavar="PATH",
+                        help="bind this socket instead of the engine default "
+                             "(systemd socket activation is used when provided)")
+    parser.add_argument("--test-backend", type=Path, default=None, metavar="FILE",
+                        help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+    if args.socket is not None:
+        socket_path = args.socket
+    elif listen_fds_ready():  # env-only decision: fd 3 is wrapped once, in serve()
+        socket_path = None
+    else:
+        socket_path = runtime_dir() / f"{args.engine}.sock"
+    try:
+        return serve(args.engine, socket_path, max(1.0, args.idle_exit),
+                     str(args.test_backend) if args.test_backend else None)
+    except RuntimeError as exc:
+        print(f"speak-daemon: {exc}", file=sys.stderr)
+        return 1
+    except EngineChanged as exc:
+        print(f"speak-daemon: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

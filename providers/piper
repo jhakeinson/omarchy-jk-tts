@@ -10,6 +10,7 @@
 set -uo pipefail
 umask 077
 source "$TTS_PLUGIN_DIR/lib/play.sh"
+source "$TTS_PLUGIN_DIR/lib/cache.sh"
 # The managed engine counts only when it was built from the lock this
 # release ships; otherwise fall through to a distribution-installed piper.
 ENGINE_DIR="${TTS_DATA_DIR:-$HOME/.local/share/omarchy-tts}/engines/piper"
@@ -74,4 +75,38 @@ RATE_HZ="$(jq -r '.audio.sample_rate // 22050' "$MODEL.json" 2>/dev/null)"
 # length-scale is inverse speed: 0.5 = twice as fast.
 LEN="$(awk -v r="${TTS_RATE:-1.0}" 'BEGIN{ if (r<=0) r=1; printf "%.3f", 1/r }')"
 
-"$PIPER_BIN" -m "$MODEL" --output-raw --length-scale "$LEN" 2>/dev/null | play_raw "$RATE_HZ" 1
+# The synthesis inputs are pinned here (text-sanitized bytes, voice model,
+# effective rate) — the exact tuple that makes Piper's output deterministic.
+TEXT_FILE="$(mktemp "${TMPDIR:-/tmp}/omarchy-tts-text.XXXXXXXX")"
+PCM_STAGE=""
+rm_text() { rm -f -- "$TEXT_FILE" "$PCM_STAGE"; }
+trap rm_text EXIT
+cat > "$TEXT_FILE"
+
+CK=""
+if audio_cache_enabled; then
+  # The model path (not just the voice name: custom models differ) plus the
+  # post-clamp length-scale are the rest of the determinism key; the model
+  # path decides RATE_HZ, which the playback and cache share.
+  CK="$(audio_cache_key piper "$MODEL" "$LEN" < "$TEXT_FILE")"
+  if CACHED="$(audio_cache_lookup piper "$CK")"; then
+    rm -f -- "$TEXT_FILE"
+    # play_raw takes over this process (it execs the player), so the trap is
+    # moot here: everything was removed above by hand.
+    play_raw "$RATE_HZ" 1 < "$CACHED"
+  fi
+  PCM_STAGE="$(audio_cache_stage piper "$CK")"
+fi
+
+if [[ -n "$PCM_STAGE" ]]; then
+  "$PIPER_BIN" -m "$MODEL" --output-raw --length-scale "$LEN" \
+    < "$TEXT_FILE" 2>/dev/null | tee -- "$PCM_STAGE" | play_raw "$RATE_HZ" 1
+  piper_rc=$?
+  if (( piper_rc == 0 )); then
+    audio_cache_commit piper "$CK" "$PCM_STAGE"
+  fi
+  exit "$piper_rc"
+fi
+
+"$PIPER_BIN" -m "$MODEL" --output-raw --length-scale "$LEN" \
+  < "$TEXT_FILE" 2>/dev/null | play_raw "$RATE_HZ" 1

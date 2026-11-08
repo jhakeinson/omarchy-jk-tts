@@ -5,6 +5,7 @@ import importlib.machinery
 import importlib.util
 import hashlib
 import json
+import shlex
 import uuid
 import zipfile
 import shutil
@@ -18,6 +19,7 @@ import tempfile
 import time
 import unittest
 import unittest.mock
+import threading
 import io
 import contextlib
 
@@ -39,6 +41,19 @@ def load_setup_module():
         loader.exec_module(module)
     finally:
         os.umask(previous_umask)
+    return module
+
+
+DAEMON = ROOT / "bin" / "speak-daemon"
+
+
+def load_daemon_module():
+    """Load the resident synthesis daemon without invoking its CLI."""
+    name = f"_omarchy_tts_daemon_test_{time.time_ns()}"
+    loader = importlib.machinery.SourceFileLoader(name, str(DAEMON))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
     return module
 
 
@@ -1576,7 +1591,7 @@ class CliConfigTests(unittest.TestCase):
         self.assertNotIn("download_enabled=True", source)
         self.assertIn('"venv", "--relocatable"', source)
         for engine, top in (("piper", "piper-tts==1.7.0"), ("kokoro", "kokoro==0.9.4"),
-                            ("easyocr", "easyocr==1.7.2")):
+                            ("kokoro-onnx", "kokoro-onnx==0.6.1"), ("easyocr", "easyocr==1.7.2")):
             spec = (ROOT / "lib" / "engines" / f"{engine}.in").read_text()
             self.assertIn(top, spec, engine)
             blocks = self.lock_blocks((ROOT / "lib" / "engines" / f"{engine}.lock").read_text())
@@ -1627,8 +1642,10 @@ class CliConfigTests(unittest.TestCase):
         setup.ensure_uv = lambda: "/usr/bin/uv"
         setup.install_kokoro_models = lambda models: calls.append(["models", str(models)])
         setup.install_easyocr_models = lambda models: calls.append(["models", str(models)])
+        setup.install_kokoro_onnx_models = lambda models: calls.append(["models", str(models)])
         setup.write_state = lambda *a, **k: None
-        for engine, build in (("piper", setup.build_piper), ("kokoro", setup.build_kokoro), ("easyocr", setup.build_easyocr)):
+        for engine, build in (("piper", setup.build_piper), ("kokoro", setup.build_kokoro),
+                              ("kokoro-onnx", setup.build_kokoro_onnx), ("easyocr", setup.build_easyocr)):
             calls.clear()
             target = Path(self.temp.name, f"stage-{engine}")
             build(target)
@@ -1682,20 +1699,23 @@ class CliConfigTests(unittest.TestCase):
         (tools / "python").write_text("#!/usr/bin/env bash\nprintf ran > \"$ENGINE_MARKER\"\nexit 0\n")
         (tools / "python").chmod(0o755)
         data = Path(self.temp.name, "stale-data")
-        for engine in ("kokoro", "easyocr"):
+        for engine in ("kokoro", "kokoro-onnx", "easyocr"):
             (data / "engines" / engine / "bin").mkdir(parents=True)
             shutil.copy(tools / "python", data / "engines" / engine / "bin" / "python")
             (data / "engines" / engine / "models").mkdir()
         (data / "engines" / "kokoro" / "models" / "kokoro-v1_0.pth").write_bytes(b"x")
+        (data / "engines" / "kokoro-onnx" / "models" / "kokoro-v1.0.onnx").write_bytes(b"x")
         (data / "engines" / "easyocr" / "models" / "craft_mlt_25k.pth").write_bytes(b"x")
         env = {**os.environ, "TTS_PLUGIN_DIR": str(ROOT), "TTS_DATA_DIR": str(data),
                "TTS_CONFIG": str(Path(self.temp.name, "c.json")), "TTS_SILENT": "1", "ENGINE_MARKER": str(marker)}
         Path(self.temp.name, "c.json").write_text("{}")
-        for script in (ROOT / "providers" / "kokoro", ROOT / "ocr" / "easyocr"):
+        for engine, script in (("kokoro", ROOT / "providers" / "kokoro"),
+                               ("kokoro-onnx", ROOT / "providers" / "kokoro-onnx"),
+                               ("easyocr", ROOT / "ocr" / "easyocr")):
             result = subprocess.run([script], input=b"Probe.", capture_output=True, env=env)
-            self.assertEqual(result.returncode, 127, (script.name, result.stderr))
-            self.assertIn(b"installed by an earlier release", result.stderr, script.name)
-            self.assertFalse(marker.exists(), script.name)
+            self.assertEqual(result.returncode, 127, (engine, result.stderr))
+            self.assertIn(b"installed by an earlier release", result.stderr, engine)
+            self.assertFalse(marker.exists(), engine)
 
     def test_language_install_goes_through_the_privileged_path_only(self):
         setup = load_setup_module()
@@ -1785,7 +1805,8 @@ class CliConfigTests(unittest.TestCase):
             hashlib.sha256((ROOT / "lib" / "engines" / "piper.lock").read_bytes()).hexdigest() + "\n")
         env = {**os.environ, "TTS_PLUGIN_DIR": str(ROOT), "TTS_CONFIG": str(Path(self.temp.name, "c.json")),
                "TTS_DATA_DIR": str(data), "PIPER_VOICES_DIR": str(voices), "TTS_SILENT": "1",
-               "PIPER_MARKER": str(marker), "XDG_RUNTIME_DIR": str(Path(self.temp.name, "run"))}
+               "PIPER_MARKER": str(marker), "XDG_RUNTIME_DIR": str(Path(self.temp.name, "run")),
+               "XDG_CACHE_HOME": str(Path(self.temp.name, "cache"))}
         Path(self.temp.name, "run").mkdir(exist_ok=True)
         Path(self.temp.name, "c.json").write_text("{}")
         result = subprocess.run([ROOT / "providers" / "piper"], input=b"Probe.", capture_output=True,
@@ -1798,6 +1819,52 @@ class CliConfigTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(marker.exists(), "a voice outside the catalogue is the user's own")
 
+    def test_piper_repeated_presses_come_from_the_cache(self):
+        tools = Path(self.temp.name, "cache-piper-tools")
+        tools.mkdir()
+        marker = Path(self.temp.name, "synth-runs")
+        # The fake engine both records that synthesis ran and emits the
+        # PCM-looking audio the cache would store.
+        fake_piper = tools / "piper"
+        fake_piper.write_text(
+            "#!/usr/bin/env bash\ncat >/dev/null\nprintf ran >> \"$PIPER_MARKER\"\n"
+            "printf '\\x01\\x00\\x02\\x00\\x03\\x00\\x04\\x00'\n")
+        fake_piper.chmod(0o755)
+        voices = Path(self.temp.name, "cache-voices")
+        voices.mkdir()
+        (voices / "custom-voice.onnx").write_bytes(b"my own model")
+        (voices / "custom-voice.onnx.json").write_text('{"audio": {"sample_rate": 22050}}')
+        data = Path(self.temp.name, "cache-piper-data")
+        (data / "engines" / "piper" / "bin").mkdir(parents=True)
+        shutil.copy(fake_piper, data / "engines" / "piper" / "bin" / "piper")
+        (data / "engines" / "piper" / ".lock-sha256").write_text(
+            hashlib.sha256((ROOT / "lib" / "engines" / "piper.lock").read_bytes()).hexdigest() + "\n")
+        env = {**os.environ, "TTS_PLUGIN_DIR": str(ROOT), "TTS_CONFIG": str(Path(self.temp.name, "c.json")),
+               "TTS_DATA_DIR": str(data), "PIPER_VOICES_DIR": str(voices), "TTS_SILENT": "1",
+               "PIPER_MARKER": str(marker), "XDG_RUNTIME_DIR": str(Path(self.temp.name, "run")),
+               "XDG_CACHE_HOME": str(Path(self.temp.name, "cache"))}
+        Path(self.temp.name, "run").mkdir(exist_ok=True)
+        Path(self.temp.name, "c.json").write_text("{}")
+        press = lambda **extra: subprocess.run(
+            [ROOT / "providers" / "piper"], input=b"Probe.", capture_output=True,
+            env={**env, **extra}, check=False)
+
+        first = press(TTS_VOICE="custom-voice")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(len(marker.read_text()), 3, "one synthesis ran")  # "ran"
+        second = press(TTS_VOICE="custom-voice")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(len(marker.read_text()), 3,
+                         "the repeated press is a file read, not a synthesis")
+        audio = Path(self.temp.name, "cache", "omarchy-tts", "audio")
+        entries = list(audio.glob("piper-*.pcm"))
+        self.assertEqual(len(entries), 1, "one cache entry")
+        self.assertEqual(entries[0].stat().st_mode & 0o777, 0o600)
+        third = press(TTS_VOICE="custom-voice", TTS_CACHE="0")
+        self.assertEqual(third.returncode, 0, third.stderr)
+        self.assertEqual(len(marker.read_text()), 6,
+                         "with the cache off Piper synthesizes again")
+
     def test_model_artefacts_are_pinned_to_immutable_sources_with_digests(self):
         manifest = json.loads((ROOT / "lib" / "engines" / "models.json").read_text())
         for name, entry in manifest["easyocr"]["models"].items():
@@ -1809,6 +1876,13 @@ class CliConfigTests(unittest.TestCase):
         self.assertRegex(kokoro["revision"], r"^[0-9a-f]{40}$")
         for path in ("config.json", "kokoro-v1_0.pth", "voices/af_heart.pt"):
             self.assertRegex(kokoro["files"][path]["sha256"], r"^[0-9a-f]{64}$", path)
+        onnx = manifest["kokoro-onnx"]
+        self.assertRegex(onnx["note"], r"int8 quantization measured 4\.2[xy] slower", "the bring-up benchmark stays on record")
+        for path in ("kokoro-v1.0.onnx", "voices-v1.0.bin"):
+            self.assertRegex(onnx["files"][path]["url"],
+                             r"^https://github\.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1\.0/[^/]+$", path)
+            self.assertRegex(onnx["files"][path]["sha256"], r"^[0-9a-f]{64}$", path)
+            self.assertGreater(onnx["files"][path]["size"], 0, path)
         provider = (ROOT / "providers" / "kokoro").read_text()
         for voice in re.findall(r'"(a[fm]_[a-z]+|b[fm]_[a-z]+)"', (ROOT / "bin" / "speak").read_text()):
             self.assertIn(f"voices/{voice}.pt", kokoro["files"], f"bundled voice {voice} has no digest")
@@ -2133,6 +2207,912 @@ class CliConfigTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("lock symlink", result.stderr)
         self.assertEqual(victim.read_text(), "keep me")
+
+
+class KokoroVerifiedRecordTests(unittest.TestCase):
+    """Per-press model verification is stat-cheap on a current .verified
+    record; any press without one pays a full digest re-verification that
+    republishes the record on a pass."""
+
+    PROVIDER = "kokoro"
+    SECTION = "kokoro"
+    ENV_PY = "KOKORO_PYTHON"
+    ENV_MODELS = "KOKORO_MODELS"
+    NAMES = ("config.json", "kokoro-v1_0.pth", "voices/af_heart.pt")
+    MAIN_NAME = "config.json"
+    HEAVY_NAME = "kokoro-v1_0.pth"
+    VOICE_NAME = "voices/af_heart.pt"
+    PAYLOADS = {"config.json": b"{}\n",
+                "kokoro-v1_0.pth": b"fake-model-bytes",
+                "voices/af_heart.pt": b"fake-voice-bytes"}
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        temp = Path(self.temp.name)
+        self.plugin = temp / "plugin"
+        (self.plugin / "lib" / "engines").mkdir(parents=True)
+        shutil.copy(ROOT / "lib" / "play.sh", self.plugin / "lib" / "play.sh")
+        shutil.copy(ROOT / "lib" / "cache.sh", self.plugin / "lib" / "cache.sh")
+        self.models = temp / "models"
+        self.models.mkdir(parents=True)
+        if any("/" in name for name in self.NAMES):
+            (self.models / "voices").mkdir(parents=True)
+        self.payloads = {**self.PAYLOADS}
+        for name, payload in self.payloads.items():
+            (self.models / name).write_bytes(payload)
+        manifest = {self.SECTION: {"repo": "example/fake", "revision": "0" * 40, "files": {
+            name: {"sha256": hashlib.sha256(self.payloads[name]).hexdigest(),
+                   "size": len(self.payloads[name])}
+            for name in self.NAMES}}}
+        (self.plugin / "lib" / "engines" / "models.json").write_text(json.dumps(manifest))
+
+        self.tools = temp / "engine-tools"
+        self.tools.mkdir()
+        self.digest_marks = temp / "digest-ran"
+        real_digest = shutil.which("sha256sum")
+        self.assertNotEqual(real_digest, None)
+        (self.tools / "sha256sum").write_text(
+            f'#!/usr/bin/env bash\nprintf ran >> "$DIGEST_MARK"\nexec {real_digest} "$@"\n')
+        (self.tools / "sha256sum").chmod(0o755)
+        self.python_ran = temp / "python-ran"
+        self.python = self.tools / "python"
+        self.python.write_text(f'#!/usr/bin/env bash\ntouch "{self.python_ran}"\n')
+        self.python.chmod(0o755)
+        (temp / "config.json").write_text("{}")
+        self.record = self.models.parent / ".verified"
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def run_kokoro(self):
+        return subprocess.run([ROOT / "providers" / self.PROVIDER], input=b"Probe.",
+                              capture_output=True, check=False,
+                              env={**os.environ, "TTS_PLUGIN_DIR": str(self.plugin),
+                                   self.ENV_PY: str(self.python),
+                                   self.ENV_MODELS: str(self.models),
+                                   "TTS_VOICE": "af_heart", "TTS_SILENT": "1",
+                                   "TTS_CONFIG": str(Path(self.temp.name, "config.json")),
+                                   "DIGEST_MARK": str(self.digest_marks),
+                                   # The cache key digests the text, not the
+                                   # models; these tests measure verification
+                                   # cost specifically, so the cache stays off.
+                                   "TTS_CACHE": "0",
+                                   "PATH": str(self.tools) + os.pathsep + os.environ["PATH"]})
+
+    def fingerprint(self, name=None):
+        metadata = (self.models / name).stat()
+        seconds, nanoseconds = divmod(metadata.st_mtime_ns, 1_000_000_000)
+        return f"{metadata.st_dev}:{metadata.st_ino}:{metadata.st_size}:{seconds}.{nanoseconds:09d}"
+
+    def write_record(self, fingerprints=None, raw=None):
+        if raw is not None:
+            self.record.write_text(raw)
+            self.record.chmod(0o600)
+            return
+        record = {"version": 1, "files": {}}
+        for name in self.NAMES:
+            record["files"][name] = {
+                "sha256": hashlib.sha256(self.payloads[name]).hexdigest(),
+                "fingerprint": self.fingerprint(name)}
+        if fingerprints is not None:
+            for name, fingerprint in fingerprints.items():
+                record["files"][name]["fingerprint"] = fingerprint
+        self.record.write_text(json.dumps(record, sort_keys=True) + "\n")
+        self.record.chmod(0o600)
+
+    def test_current_record_passes_without_a_digest_read(self):
+        self.write_record()
+        result = self.run_kokoro()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.python_ran.exists())
+        self.assertFalse(self.digest_marks.exists())
+        self.assertEqual((self.models / self.HEAVY_NAME).read_bytes(),
+                         self.payloads[self.HEAVY_NAME])
+
+    def test_missing_record_redigests_and_republishes(self):
+        result = self.run_kokoro()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.digest_marks.exists())
+        record = json.loads(self.record.read_text())
+        self.assertEqual(record["version"], 1)
+        for name in self.NAMES:
+            self.assertEqual(record["files"][name]["fingerprint"], self.fingerprint(name))
+            self.assertEqual(record["files"][name]["sha256"],
+                             hashlib.sha256(self.payloads[name]).hexdigest())
+        self.assertEqual(self.record.stat().st_mode & 0o777, 0o600)
+
+    def test_stale_record_redigests_and_republishes(self):
+        self.write_record(fingerprints={self.MAIN_NAME: self.fingerprint(self.MAIN_NAME).replace(":", ".1", 2)})
+        before = self.record.read_text()
+        result = self.run_kokoro()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.digest_marks.exists())
+        self.assertNotEqual(self.record.read_text(), before)
+        self.assertEqual(json.loads(self.record.read_text())["files"][self.MAIN_NAME]["fingerprint"],
+                         self.fingerprint(self.MAIN_NAME))
+        self.assertEqual(self.record.stat().st_mode & 0o777, 0o600)
+
+    def test_stale_record_fails_loudly_on_tampered_bytes(self):
+        self.write_record(fingerprints={self.HEAVY_NAME: self.fingerprint(self.HEAVY_NAME) + "9"})
+        (self.models / self.HEAVY_NAME).write_bytes(b"tampered-bytes")
+        before = self.record.read_text()
+        result = self.run_kokoro()
+        self.assertEqual(result.returncode, 65, result.stderr)
+        self.assertIn(b"failed verification", result.stderr)
+        self.assertTrue(self.digest_marks.exists())
+        self.assertFalse(self.python_ran.exists())
+        self.assertEqual(self.record.read_text(), before,
+                         "a failed re-verification must republish nothing")
+
+    def test_record_never_follows_a_symlink(self):
+        victim = Path(self.temp.name, "victim")
+        victim.write_text("keep me")
+        self.record.unlink(missing_ok=True)
+        self.record.symlink_to(victim)
+        result = self.run_kokoro()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.digest_marks.exists())
+        self.assertEqual(victim.read_text(), "keep me")
+        self.assertFalse(self.record.is_symlink(), "a passing re-verification replaces the symlink")
+        self.assertEqual(self.record.stat().st_mode & 0o777, 0o600)
+
+        victim.write_text("still intact")
+        self.record.unlink(missing_ok=True)
+        self.record.symlink_to(victim)
+        result = self.run_kokoro()
+        self.assertEqual(result.returncode, 0, result.stderr)  # digests still match
+        self.assertEqual(victim.read_text(), "still intact")
+
+        # And when the digest fallback cannot pass, the victim stays untouched.
+        victim.write_text("keep me")
+        (self.models / self.VOICE_NAME).write_bytes(b"tampered-voice")
+        result = self.run_kokoro()
+        self.assertEqual(result.returncode, 65, result.stderr)
+        self.assertIn(b"failed verification", result.stderr)
+        self.assertEqual(victim.read_text(), "keep me")
+
+    def test_corrupt_record_behaves_like_a_missing_one(self):
+        self.write_record(raw="{not json at all\n")
+        (self.models / self.VOICE_NAME).write_bytes(b"tampered-voice")
+        result = self.run_kokoro()
+        self.assertEqual(result.returncode, 65, result.stderr)
+        self.assertIn(b"failed verification", result.stderr)
+        self.assertTrue(self.digest_marks.exists())
+
+    def test_installer_publishes_the_record_the_provider_accepts(self):
+        # Real manifest structure, small stand-in files: the record the
+        # installer publishes must be exactly what the provider accepts.
+        setup = load_setup_module()
+        models = Path(self.temp.name, "installer-models")
+        real_manifest = json.loads((ROOT / "lib" / "engines" / "models.json").read_text())
+        for name in real_manifest[self.SECTION]["files"]:
+            (models / name).parent.mkdir(parents=True, exist_ok=True)
+            (models / name).write_bytes(b"stand-in")
+        setup.record_model_verification(self.SECTION, models)
+        record = models.parent / ".verified"
+        self.assertEqual(record.stat().st_mode & 0o777, 0o600)
+        published = json.loads(record.read_text())
+        self.assertEqual(set(published["files"]),
+                         set(real_manifest[self.SECTION]["files"]))
+        self.models = models
+        self.record = record
+        result = self.run_kokoro()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.digest_marks.exists(),
+                         "an installer-published record must make the press cheap")
+
+
+class KokoroOnnxRecordTests(KokoroVerifiedRecordTests):
+    """The ONNX engine's provider pays the same fingerprint check and the
+    same fallback-and-republish behavior for the pinned graph and voice-pack."""
+
+    PROVIDER = "kokoro-onnx"
+    SECTION = "kokoro-onnx"
+    ENV_PY = "KOKORO_ONNX_PYTHON"
+    ENV_MODELS = "KOKORO_ONNX_MODELS"
+    NAMES = ("kokoro-v1.0.onnx", "voices-v1.0.bin")
+    MAIN_NAME = "kokoro-v1.0.onnx"
+    HEAVY_NAME = "kokoro-v1.0.onnx"
+    VOICE_NAME = "voices-v1.0.bin"
+    PAYLOADS = {"kokoro-v1.0.onnx": b"fake-graph-bytes",
+                "voices-v1.0.bin": b"fake-voicepack-bytes"}
+
+
+class SpeakDaemonTests(unittest.TestCase):
+    """The resident daemon serves the provider contract over a private unix
+    socket: bounded JSON requests, s16le PCM replies, refused requests closed
+    empty, idle self-exit and an ended daemon when the engine file changes."""
+
+    temp: tempfile.TemporaryDirectory
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.backend_file = Path(self.temp.name, "backend.py")
+        self.samples = [bytes(range(64, 96)), bytes(32) * 96]
+        self.backend_file.write_text(
+            "PCM = bytes(range(64, 96))\n"
+            "def synthesize(text, voice, speed, cancelled):\n"
+            "    yield PCM\n"
+            "    if text == 'two chunks':\n"
+            "        yield bytes(32) * 96\n")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def socket_path(self) -> Path:
+        return Path(self.temp.name, "provider.sock")
+
+    def start_daemon(self, *args, engine="kokoro", explicit_socket=True) -> subprocess.Popen:
+        command = [sys.executable, str(DAEMON), "--engine", engine, *args]
+        if explicit_socket:
+            command += ["--socket", str(self.socket_path())]
+        return subprocess.Popen(
+            command,
+            env={**os.environ, "XDG_RUNTIME_DIR": self.temp.name},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def wait_for_socket(self, process: subprocess.Popen = None,
+                        timeout: float = 5.0) -> bool:
+        path = self.socket_path()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if process is not None and process.poll() is not None:
+                return False
+            if path.is_socket():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def daemon_stderr(self, process: subprocess.Popen = None) -> str:
+        assert process is not None and process.poll() is not None
+        return process.stderr.read().decode()
+
+    def request(self, raw: bytes) -> bytes:
+        """One press: send a header, read the whole reply."""
+        import socket
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(5.0)
+        sock.connect(str(self.socket_path()))
+        sock.sendall(raw + b"\n")
+        reply = b""
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            reply += chunk
+        sock.close()
+        return reply
+
+    def header(self, **overrides) -> bytes:
+        request = {"voice": "af_heart", "speed": 1.0, "text": "Probe."}
+        request.update(overrides)
+        return json.dumps(request).encode()
+
+    def test_serves_pcm_over_the_private_socket(self):
+        daemon = self.start_daemon("--test-backend", str(self.backend_file))
+        try:
+            ready = self.wait_for_socket(daemon)
+            if not ready:
+                self.fail(self.daemon_stderr(daemon))
+            self.assertEqual(self.request(self.header()), self.samples[0])
+            self.assertEqual(self.request(self.header(text="two chunks")),
+                             self.samples[0] + self.samples[1])
+            self.assertEqual(daemon.poll(), None, "the daemon keeps serving")
+        finally:
+            daemon.terminate()
+            daemon.wait(timeout=5)
+
+    def test_refused_requests_close_with_no_bytes(self):
+        daemon = self.start_daemon("--test-backend", str(self.backend_file))
+        try:
+            ready = self.wait_for_socket(daemon)
+            if not ready:
+                self.fail(self.daemon_stderr(daemon))
+            for label, raw in (("not json", b"{oops"),
+                               ("not an object", b"[]"),
+                               ("bad voice", self.header(voice="BAD")),
+                               ("empty text", self.header(text="   ")),
+                               ("speed NaN", b'{"voice":"af_heart","speed":NaN,"text":"x"}')):
+                with self.subTest(label):
+                    self.assertEqual(self.request(raw), b"", label)
+            self.assertEqual(daemon.poll(), None, "refusals keep the daemon alive")
+        finally:
+            daemon.terminate()
+            daemon.wait(timeout=5)
+
+    def test_requests_are_bounded(self):
+        daemon_module = load_daemon_module()
+        import socket
+
+        def pair():
+            return socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+
+        losses = [
+            ("oversized header",
+             b'{"voice":"af_heart","speed":1.0,"text":"' + b"a" * (1 << 20) + b'"}\n'),
+            ("oversized text",
+             b'{"voice":"af_heart","speed":1.0,"text":"' + b"a" * (200_001) + b'"}\n'),
+            ("no trailing newline",
+             b'{"voice":"af_heart","speed":1.0,"text":"x"}'),
+        ]
+        for label, raw in losses:
+            with self.subTest(label):
+                client, server = pair()
+                sender = threading.Thread(target=client.sendall, args=(raw,))
+                sender.start()  # buffers may not hold `raw`; read while sending
+                if label == "no trailing newline":
+                    client.shutdown(socket.SHUT_WR)  # EOF, never a header end
+                with self.assertRaises(daemon_module.RequestError, msg=label):
+                    daemon_module.read_request(server)
+                sender.join(timeout=5)
+                client.close()
+                server.close()
+
+        # The good case passes every bound.
+        client, server = pair()
+        client.sendall(self.header() + b"\n")
+        request = daemon_module.read_request(server)
+        self.assertEqual(request["text"], "Probe.")
+        client.close()
+        server.close()
+
+    def test_daemon_self_exits_after_idle(self):
+        daemon = self.start_daemon("--test-backend", str(self.backend_file),
+                                   "--idle-exit", "1")
+        if not self.wait_for_socket(daemon):
+            self.fail(self.daemon_stderr(daemon))
+        self.assertEqual(daemon.wait(timeout=10), 0, self.daemon_stderr(daemon))
+        self.assertFalse(self.wait_for_socket(timeout=0.5))
+
+    def test_a_live_daemon_is_never_taken_over(self):
+        daemon = self.start_daemon("--test-backend", str(self.backend_file))
+        try:
+            ready = self.wait_for_socket(daemon)
+            if not ready:
+                self.fail(self.daemon_stderr(daemon))
+            rival = self.start_daemon("--test-backend", str(self.backend_file))
+            rival.wait(timeout=10)
+            self.assertNotEqual(rival.returncode, 0)
+        finally:
+            daemon.terminate()
+            daemon.wait(timeout=5)
+
+    def test_a_symlinked_socket_path_is_refused(self):
+        victim = Path(self.temp.name, "victim")
+        victim.write_text("keep me")
+        runtime = Path(self.temp.name, "omarchy-tts")
+        runtime.mkdir()
+        os.symlink(victim, runtime / "kokoro.sock")
+        daemon = self.start_daemon("--idle-exit", "5",
+                                   explicit_socket=False)  # default path: the symlink
+        out, err = daemon.communicate(timeout=10)
+        self.assertNotEqual(daemon.returncode, 0)
+        self.assertIn(b"refusing symlink", err)
+        self.assertEqual(victim.read_text(), "keep me",
+                         "the symlink target is never touched")
+
+    def test_engine_replacement_ends_the_daemon(self):
+        daemon_module = load_daemon_module()
+        import socket
+
+        class ReplacingBackend:
+            def check_pins(self):
+                raise daemon_module.EngineChanged("engine replaced")
+
+            def synthesize(self, text, voice, speed, cancelled):
+                raise RuntimeError("must never synthesize")
+
+        replacements = unittest.mock.patch.object(
+            daemon_module, "make_backend",
+            lambda engine, test_backend: ReplacingBackend())
+        socket_path = self.socket_path()
+        outcomes = []
+
+        def run():
+            outcomes.append(daemon_module.serve("kokoro", socket_path, 60, None))
+
+        with replacements:
+            thread = threading.Thread(target=run)
+            thread.start()
+            try:
+                self.assertTrue(self.wait_for_socket(), "socket became ready")
+                self.assertEqual(self.request(self.header()), b"",
+                                 "an engine change refuses the request")
+                thread.join(timeout=10)
+            finally:
+                pass
+            self.assertFalse(thread.is_alive(), "the daemon ends after the change")
+            self.assertEqual(outcomes[-1], 0)
+            # And it stays ended for a fresh client.
+            with self.assertRaises(OSError):
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.settimeout(1.0)
+                sock.connect(str(socket_path))
+                sock.sendall(self.header() + b"\n")
+                sock.recv(1)
+
+    def test_engine_fingerprint_notices_a_replaced_model(self):
+        daemon_module = load_daemon_module()
+        models = Path(self.temp.name, "models")
+        models.mkdir()
+        model = models / "kokoro-v1_0.pth"
+        model.write_bytes(b"installed")
+        pin = daemon_module.fingerprint(model)
+        backend = daemon_module.TorchKokoro(models)
+        backend._pins = [(model, pin)]
+        backend._ready = True
+        # stat-cheap while the file is untouched: no digest read is paid.
+        backend.check_pins()
+        os.utime(model, (1000, 1001))
+        with self.assertRaises(daemon_module.EngineChanged):
+            backend.check_pins()
+
+
+class ProviderDaemonFastPathTests(unittest.TestCase):
+    """With a resident daemon answering, a provider press is served over the
+    socket and the engine interpreter never boots; without one, the press
+    falls back to the inline synthesis it has always used."""
+
+    PROVIDER = "kokoro"
+    LOCK = "kokoro.lock"
+    ENV_PY = "KOKORO_PYTHON"
+    SECTION = "kokoro"
+    NAMES = ("config.json", "kokoro-v1_0.pth", "voices/af_heart.pt")
+    PAYLOADS = {"config.json": b"{}\n",
+                "kokoro-v1_0.pth": b"fake-model-bytes",
+                "voices/af_heart.pt": b"fake-voice-bytes"}
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        temp = Path(self.temp.name)
+        self.plugin = temp / "plugin"
+        (self.plugin / "lib" / "engines").mkdir(parents=True)
+        shutil.copy(ROOT / "lib" / "play.sh", self.plugin / "lib" / "play.sh")
+        shutil.copy(ROOT / "lib" / "cache.sh", self.plugin / "lib" / "cache.sh")
+        shutil.copy(ROOT / "lib" / "engines" / self.LOCK,
+                    self.plugin / "lib" / "engines" / self.LOCK)
+        self.payloads = {**self.PAYLOADS}
+        self.data = temp / "data"
+        engine = self.data / "engines" / self.PROVIDER
+        (engine / "bin").mkdir(parents=True)
+        (engine / "models" / "voices").mkdir(parents=True)
+        self.python_marker = temp / "engine-interpreter-ran"
+        stub = engine / "bin" / "python"
+        # The stub is a stand-in engine interpreter: it records that synthesis
+        # ran, and emits real PCM-like bytes (the cache only stores audio).
+        stub.write_text(f'#!/usr/bin/env bash\ntouch "{self.python_marker}"\n'
+                        'printf \'\\x01\\x00\\x02\\x00\\xff\\x7f\\x00\\x00\'\n')
+        stub.chmod(0o755)
+        for name, payload in self.payloads.items():
+            (engine / "models" / name).write_bytes(payload)
+        (engine / ".lock-sha256").write_text(
+            hashlib.sha256((self.plugin / "lib" / "engines" / self.LOCK)
+                           .read_bytes()).hexdigest() + "\n")
+        manifest = {self.SECTION: {"repo": "example/fake", "revision": "0" * 40,
+                                   "files": {name: {"sha256": hashlib.sha256(payload).hexdigest(),
+                                                    "size": len(payload)}
+                                             for name, payload in self.payloads.items()}}}
+        (self.plugin / "lib" / "engines" / "models.json").write_text(json.dumps(manifest))
+        (temp / "config.json").write_text("{}")
+        self.backend_file = temp / "backend.py"
+        self.backend_file.write_text(
+            "def synthesize(text, voice, speed, cancelled):\n"
+            "    yield b'\\x00\\x01' * 600\n")
+
+    def tearDown(self):
+        if getattr(self, "daemon", None) is not None:
+            self.daemon.terminate()
+            self.daemon.wait(timeout=5)
+        self.temp.cleanup()
+
+    def run_provider(self, **env_extra) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [ROOT / "providers" / self.PROVIDER], input=b"Probe.",
+            capture_output=True, check=False,
+            env={**os.environ, "TTS_PLUGIN_DIR": str(self.plugin),
+                 "TTS_DATA_DIR": str(self.data),
+                 "TTS_VOICE": "af_heart", "TTS_RATE": "1.0",
+                 "TTS_SILENT": "1", "TTS_CONFIG": str(Path(self.temp.name, "config.json")),
+                 "XDG_CACHE_HOME": str(Path(self.temp.name, "cache")),
+                 "XDG_RUNTIME_DIR": self.temp.name, **env_extra})
+
+    def start_daemon(self):
+        self.daemon = subprocess.Popen(
+            [sys.executable, str(DAEMON), "--engine", self.PROVIDER,
+             "--test-backend", str(self.backend_file), "--idle-exit", "120"],
+            env={**os.environ, "XDG_RUNTIME_DIR": self.temp.name},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        sock = Path(self.temp.name, "omarchy-tts", f"{self.PROVIDER}.sock")
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if sock.is_socket():
+                return
+            time.sleep(0.02)
+        self.fail("daemon socket never became ready")
+
+    def test_press_is_served_by_the_daemon(self):
+        self.start_daemon()
+        result = self.run_provider()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.python_marker.exists(),
+                         "the daemon serves the press; no interpreter boots")
+
+    def test_press_falls_back_inline_without_a_daemon(self):
+        self.daemon = None
+        result = self.run_provider()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.python_marker.exists(),
+                        "without a daemon the inline path speaks")
+
+
+class KokoroOnnxDaemonFastPathTests(ProviderDaemonFastPathTests):
+    PROVIDER = "kokoro-onnx"
+    LOCK = "kokoro-onnx.lock"
+    ENV_PY = "KOKORO_ONNX_PYTHON"
+    SECTION = "kokoro-onnx"
+    NAMES = ("kokoro-v1.0.onnx", "voices-v1.0.bin")
+    PAYLOADS = {"kokoro-v1.0.onnx": b"fake-graph-bytes",
+                "voices-v1.0.bin": b"fake-voicepack-bytes"}
+
+
+class SynthesisCacheUnitTests(unittest.TestCase):
+    """The on-disk synthesis cache: deterministic keying over (engine, voice,
+    speed, exact text bytes), hit/miss correctness, owner-only permissions,
+    age eviction, LRU eviction and refusal of symlinked cache paths."""
+
+    temp: tempfile.TemporaryDirectory
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.cache_home = Path(self.temp.name, "cache-home")
+        # Hermetic: an explicit cache home replaces whatever this shell
+        # inherits; PATH still carries the coreutils the library uses.
+        self.env = {"PATH": os.environ["PATH"],
+                    "HOME": str(self.temp.name),
+                    "TTS_CACHE_HOME": str(self.cache_home)}
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def cache(self, script: str, **env_extra) -> subprocess.CompletedProcess:
+        # `bash -u` keeps every unset-variable slip in the library fatal.
+        return subprocess.run(
+            ["bash", "-u", "-c",
+             "source " + shlex.quote(str(ROOT / "lib" / "cache.sh")) + "\n" + script],
+            env={**self.env, **env_extra}, capture_output=True, text=True)
+
+    def audio_dir(self) -> Path:
+        return self.cache_home / "omarchy-tts" / "audio"
+
+    def entries(self) -> list[str]:
+        if not self.audio_dir().is_dir():
+            return []
+        return sorted(p.name for p in self.audio_dir().iterdir())
+
+    def key_of(self, text: str, voice="af_heart", provider="kokoro") -> str:
+        result = self.cache(
+            f"printf {shlex.quote(text)} | audio_cache_key {provider} {voice} 1.0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_keys_are_stable_and_sensitive(self):
+        result = self.cache(r'''
+        k1=$(printf 'same' | audio_cache_key kokoro af_heart 1.0)
+        k2=$(printf 'same' | audio_cache_key kokoro af_heart 1.0)
+        kv=$(printf 'same' | audio_cache_key kokoro af_bella 1.0)
+        kr=$(printf 'same' | audio_cache_key kokoro af_heart 1.25)
+        kp=$(printf 'same' | audio_cache_key piper af_heart 1.0)
+        kt=$(printf 'diff' | audio_cache_key kokoro af_heart 1.0)
+        [ "$k1" = "$k2" ] && [ ${#k1} -eq 64 ] && echo STABLE-HEX
+        [ "$k1" != "$kv" ] && [ "$k1" != "$kr" ] && \
+          [ "$k1" != "$kp" ] && [ "$k1" != "$kt" ] && echo SENSITIVE
+        ''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("STABLE-HEX", result.stdout)
+        self.assertIn("SENSITIVE", result.stdout)
+
+    def test_miss_then_store_then_hit(self):
+        result = self.cache(r'''
+        key=$(printf 'press' | audio_cache_key kokoro af_heart 1.0)
+        [ -z "$(audio_cache_lookup kokoro "$key")" ] && echo MISS
+        stage=$(audio_cache_stage kokoro "$key")
+        case "$stage" in *".inflight-$key.part") echo STAGED ;; esac
+        printf 'AUDIO' > "$stage"
+        audio_cache_commit kokoro "$key" "$stage" && echo STORED
+        [ ! -e "$stage" ] && echo STAGE-GONE
+        got=$(audio_cache_lookup kokoro "$key")
+        [ "$(cat "$got")" = AUDIO ] && echo HIT
+        ''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for want in ("MISS", "STAGED", "STORED", "STAGE-GONE", "HIT"):
+            self.assertIn(want, result.stdout, result.stdout + result.stderr)
+
+    def test_bad_keys_are_refused(self):
+        result = self.cache(r'''
+        stage=$(audio_cache_stage kokoro "not-a-hash")
+        [ -z "$stage" ] && echo REFUSED-STAGE
+        true
+        ''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("REFUSED-STAGE", result.stdout)
+        self.assertEqual(self.entries(), [])
+
+    def test_a_disabled_cache_refuses_every_perspective(self):
+        result = self.cache(r'''
+        audio_cache_enabled || echo OFF
+        stage=$(audio_cache_stage kokoro abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789)
+        [ -z "$stage" ] && echo NO-STAGE
+        [ -z "$(audio_cache_lookup kokoro abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789)" ] \
+          && echo NO-LOOKUP
+        ''', TTS_CACHE="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for want in ("OFF", "NO-STAGE", "NO-LOOKUP"):
+            self.assertIn(want, result.stdout)
+
+    def test_cache_files_are_owner_only(self):
+        result = self.cache(r'''
+        key=$(printf 'press' | audio_cache_key kokoro af_heart 1.0)
+        stage=$(audio_cache_stage kokoro "$key"); printf 'AUDIO' > "$stage"
+        audio_cache_commit kokoro "$key" "$stage"
+        p=$(audio_cache_lookup kokoro "$key")
+        [ "$(stat -c %a "$p")" = 600 ] && echo FILE600
+        [ "$(stat -c %a "$(dirname "$p")")" = 700 ] && echo DIR700
+        ''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("FILE600", result.stdout)
+        self.assertIn("DIR700", result.stdout)
+
+    def test_aged_entries_expire(self):
+        result = self.cache(r'''
+        key=$(printf 'press' | audio_cache_key kokoro af_heart 1.0)
+        stage=$(audio_cache_stage kokoro "$key"); printf 'AUDIO' > "$stage"
+        audio_cache_commit kokoro "$key" "$stage"
+        touch -d '31 days ago' "$(audio_cache_dir)/kokoro-$key.pcm"
+        [ -z "$(audio_cache_lookup kokoro "$key")" ] && echo EXPIRED-BY-LOOKUP
+        audio_cache_trim
+        [ $(ls "$(audio_cache_dir)"/*.pcm 2>/dev/null | wc -l) -eq 0 ] && echo TRIM-GONE
+        ''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("EXPIRED-BY-LOOKUP", result.stdout)
+        self.assertIn("TRIM-GONE", result.stdout)
+
+    def test_deadline_hits_refresh_mtime(self):
+        # A hit refreshes mtime, so an entry still in use does not age out.
+        result = self.cache(r'''
+        key=$(printf 'press' | audio_cache_key kokoro af_heart 1.0)
+        stage=$(audio_cache_stage kokoro "$key"); printf 'AUDIO' > "$stage"
+        audio_cache_commit kokoro "$key" "$stage"
+        touch -d '25 days ago' "$(audio_cache_dir)/kokoro-$key.pcm"
+        aged=$(stat -c %Y "$(audio_cache_dir)/kokoro-$key.pcm")
+        audio_cache_lookup kokoro "$key" >/dev/null
+        after=$(stat -c %Y "$(audio_cache_dir)/kokoro-$key.pcm")
+        if [ "$after" -gt "$aged" ]; then echo TOUCHED; fi
+        true
+        ''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("TOUCHED", result.stdout)
+
+    def test_lru_cap_evicts_the_oldest_to_fit(self):
+        result = self.cache(r'''
+        for label in a b c; do
+          key=$(printf "$label" | audio_cache_key kokoro af_heart 1.0)
+          stage=$(audio_cache_stage kokoro "$key")
+          printf '%128s' x > "$stage"
+          audio_cache_commit kokoro "$key" "$stage"
+          sleep 0.05   # distinct mtimes make eviction order observable
+        done
+        TTS_CACHE_LIMIT_MB=0 audio_cache_trim   # zero budget: everything fits nowhere
+        [ $(ls "$(audio_cache_dir)"/*.pcm 2>/dev/null | wc -l) -eq 0 ] && echo ALL-EVICTED
+        ''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ALL-EVICTED", result.stdout)
+
+    def test_lru_cap_keeps_the_newest(self):
+        # A tight budget keeps the newest entries and drops the older ones
+        # first — entries LRU-ordered by their refreshed mtime.
+        result = self.cache(r'''
+        for label in a b c d; do
+          key=$(printf "$label" | audio_cache_key kokoro af_heart 1.0)
+          stage=$(audio_cache_stage kokoro "$key")
+          head -c 700000 /dev/zero | tr '\0' x > "$stage"
+          audio_cache_commit kokoro "$key" "$stage"
+          sleep 0.05
+        done
+        dir=$(audio_cache_dir)
+        for each in a b c d; do
+          key=$(printf "$each" | audio_cache_key kokoro af_heart 1.0)
+          if [ -f "$dir/kokoro-$key.pcm" ]; then printf %s "$each"; fi
+        done
+        echo ''
+        ''', TTS_CACHE_LIMIT_MB="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "d",
+                         "the 1 MiB budget keeps only the newest entry")
+
+    def test_stale_inflight_stages_are_reclaimed(self):
+        result = self.cache(r'''
+        key=$(printf 'press' | audio_cache_key kokoro af_heart 1.0)
+        stage=$(audio_cache_stage kokoro "$key"); printf 'HALF' > "$stage"
+        touch -d '2 hours ago' "$stage"
+        audio_cache_trim
+        [ ! -e "$stage" ] && echo RECLAIMED
+        ''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("RECLAIMED", result.stdout)
+
+    def test_a_symlinked_audio_dir_is_refused(self):
+        target = Path(self.temp.name, "elsewhere")
+        target.mkdir()
+        parent = self.audio_dir().parent
+        parent.mkdir(parents=True)
+        os.symlink(target, self.audio_dir())
+        result = self.cache(r'''
+        key=$(printf 'press' | audio_cache_key kokoro af_heart 1.0)
+        stage=$(audio_cache_stage kokoro "$key")
+        [ -z "$stage" ] && echo REFUSED
+        ''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("REFUSED", result.stdout)
+        self.assertEqual(list(target.iterdir()), [], "nothing written through the link")
+
+    def test_a_symlinked_entry_is_refused(self):
+        result = self.cache(r'''
+        key=$(printf 'press' | audio_cache_key kokoro af_heart 1.0)
+        stage=$(audio_cache_stage kokoro "$key"); printf 'AUDIO' > "$stage"
+        audio_cache_commit kokoro "$key" "$stage"
+        found=$(audio_cache_lookup kokoro "$key")
+        [ -n "$found" ] && echo HIT
+        mv "$found" "$found.real"
+        ln -s /nonexistent "$found"
+        [ -z "$(audio_cache_lookup kokoro "$key")" ] && echo LINK-REFUSED
+        ''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("HIT", result.stdout)
+        self.assertIn("LINK-REFUSED", result.stdout)
+
+    def test_the_cache_can_be_opted_out(self):
+        result = self.cache(r'''
+        audio_cache_enabled || echo OFF
+        [ -z "$(audio_cache_stage kokoro abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789)" ] \
+          && echo NO-STAGE
+        ''', TTS_CACHE="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("OFF", result.stdout)
+        self.assertIn("NO-STAGE", result.stdout)
+
+
+class ProviderCacheTests(ProviderDaemonFastPathTests):
+    """A repeated press is played from the cache: no daemon request, no
+    interpreter boot, and the stored entry is exactly what was played."""
+
+    def marker_mtime(self):
+        return self.python_marker.stat().st_mtime
+
+    def test_repeated_press_serves_from_the_cache(self):
+        self.start_daemon()
+        first = self.run_provider()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        audio = Path(self.temp.name, "cache", "omarchy-tts", "audio")
+        entries = list(audio.glob("*.pcm")) if audio.is_dir() else []
+        self.assertEqual(len(entries), 1, "the served press is cached")
+        self.assertFalse(self.python_marker.exists(),
+                         "the daemon synthesizes; the interpreter never boots")
+        # The daemon and its socket are gone entirely: only the cache remains.
+        self.daemon.terminate()
+        self.daemon.wait(timeout=5)
+        self.daemon = None
+        second = self.run_provider(TTS_DAEMON="0")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertFalse(self.python_marker.exists(),
+                         "a repeated press is served from the cache, "
+                         "without booting the engine")
+
+    def test_a_cache_hit_leaves_the_interpreter_untouched(self):
+        self.daemon = None
+        first = self.run_provider()  # no daemon anywhere: inline path synthesizes
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertTrue(self.python_marker.exists())
+        before = self.marker_mtime()
+        second = self.run_provider()  # same press: straight from the cache
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(self.marker_mtime(), before,
+                         "the cache holds this text; nothing re-synthesized")
+        audio = Path(self.temp.name, "cache", "omarchy-tts", "audio")
+        self.assertEqual(len(list(audio.glob("*.pcm"))), 1, "no duplicate entries")
+
+    def test_cache_opt_out_synthesizes_every_press(self):
+        self.daemon = None
+        for _ in range(2):
+            result = self.run_provider(TTS_CACHE="0", TTS_DAEMON="0")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(self.python_marker.exists(),
+                            "synthesis always runs with the cache off")
+        self.assertFalse(list(Path(self.temp.name, "cache").glob("**/*.pcm")),
+                         "opted out: nothing is stored")
+
+
+class DaemonUnitInstallTests(unittest.TestCase):
+    """Installing a heavy engine publishes the resident daemon's systemd
+    socket and service units and enables the listener — best effort, so an
+    absent or broken systemd never fails an installation that proved fine."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.unit_dir = Path(self.temp.name, "systemd", "user")
+        self.engine_root = Path(self.temp.name, "engines")
+        (self.engine_root / "kokoro" / "bin").mkdir(parents=True)
+        (self.engine_root / "kokoro" / "bin" / "python").write_text("stub")
+        (self.engine_root / "kokoro-onnx" / "bin").mkdir(parents=True)
+        (self.engine_root / "kokoro-onnx" / "bin" / "python").write_text("stub")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def install(self, engine="kokoro", missing_python=False):
+        setup = load_setup_module()
+        units_dir = self.unit_dir
+        engine_root = self.engine_root
+        if missing_python:
+            for engine in ("kokoro", "kokoro-onnx"):
+                (engine_root / engine / "bin" / "python").unlink()
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 0)
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(unittest.mock.patch.object(setup, "CONFIG_HOME",
+                                                           Path(self.temp.name)))
+            stack.enter_context(unittest.mock.patch.object(setup, "ENGINE", engine_root))
+            stack.enter_context(unittest.mock.patch.object(setup, "PLUGIN", ROOT))
+            stack.enter_context(unittest.mock.patch.object(setup.subprocess, "run",
+                                                           fake_run))
+            setup.install_daemon_units(engine)
+        return units_dir, calls
+
+    def read(self, name):
+        return (self.unit_dir / name).read_text()
+
+    def test_units_are_published_and_the_listener_enabled(self):
+        units_dir, calls = self.install()
+        self.assertEqual(sorted(p.name for p in units_dir.iterdir()),
+                         ["omarchy-tts-kokoro.service", "omarchy-tts-kokoro.socket"])
+        self.assertIn("ListenStream=%t/omarchy-tts/kokoro.sock",
+                      self.read("omarchy-tts-kokoro.socket"))
+        self.assertIn("SocketMode=0600", self.read("omarchy-tts-kokoro.socket"))
+        self.assertIn("RemoveOnStop=true", self.read("omarchy-tts-kokoro.socket"))
+        service = self.read("omarchy-tts-kokoro.service")
+        self.assertIn("--engine kokoro", service)
+        self.assertIn("NoNewPrivileges=true", service)
+        self.assertIn("Restart=no", service)
+        self.assertIn("kokoro/bin/python", service)
+        self.assertIn(str(ROOT / "bin" / "speak-daemon"), service)
+        self.assertIn("StartLimitIntervalSec=0", service)
+        self.assertEqual(calls[0], ["systemctl", "--user", "daemon-reload"])
+        self.assertEqual(calls[1], ["systemctl", "--user", "enable", "--now",
+                                    "omarchy-tts-kokoro.socket"])
+
+    def test_unit_files_are_world_readable(self):
+        units_dir, _ = self.install()
+        for name in ("omarchy-tts-kokoro.socket", "omarchy-tts-kokoro.service"):
+            self.assertEqual((units_dir / name).stat().st_mode & 0o777, 0o644, name)
+
+    def test_unknown_engines_have_no_daemon(self):
+        with self.assertRaises(RuntimeError):
+            self.install(engine="piper")
+        self.assertEqual(list(self.unit_dir.glob("*")), [])
+
+    def test_units_are_skipped_when_the_engine_is_gone(self):
+        units_dir, calls = self.install(missing_python=True)
+        self.assertEqual(list(units_dir.glob("omarchy-tts-*")), [])
+        self.assertEqual(calls, [], "nothing is enabled that would point nowhere")
+
+    def test_the_onnx_engine_gets_its_own_units(self):
+        _, calls = self.install(engine="kokoro-onnx")
+        self.assertEqual(sorted(p.name for p in self.unit_dir.iterdir()),
+                         ["omarchy-tts-kokoro-onnx.service",
+                          "omarchy-tts-kokoro-onnx.socket"])
 
 
 class CredentialLifecycleTests(unittest.TestCase):

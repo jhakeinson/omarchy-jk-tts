@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+# Baseline latency benchmark for the local Kokoro engine.
+#
+#   tools/bench-startup [--runs N] [--voice NAME] [--text TEXT]
+#
+# Times one Kokoro synthesis staged exactly the way providers/kokoro runs it:
+# the sha256 model verification, interpreter boot, imports, model and pipeline
+# load, phonemize-to-first-audio, and full synthesis. Read-only: it installs
+# nothing and plays no audio (the synthesized bytes go to /dev/null). The
+# numbers are the acceptance criteria for the plugin's latency phases; record
+# each run in docs/benchmarks.md.
+set -euo pipefail
+umask 077
+
+root="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+manifest="$root/lib/engines/models.json"
+lock="$root/lib/engines/kokoro.lock"
+
+usage() { printf 'usage: %s [--runs N] [--voice NAME] [--text TEXT]\n' "$(basename "$0")" >&2; exit 64; }
+
+runs=2
+voice="${TTS_VOICE:-}"
+text=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --runs) [[ $# -ge 2 ]] || usage; runs="$2"; shift 2 ;;
+    --voice) [[ $# -ge 2 ]] || usage; voice="$2"; shift 2 ;;
+    --text) [[ $# -ge 2 ]] || usage; text="$2"; shift 2 ;;
+    *) usage ;;
+  esac
+done
+[[ "$runs" =~ ^[1-9][0-9]*$ ]] || usage
+
+# A sane default that spans several synthesis chunks: nothing broken tonight,
+# nothing clever tomorrow — the same sentence every phase, every run.
+[[ -z "$text" ]] && text="The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs, and feel the rhythm of every syllable."
+[[ "$(printf '%s' "$text" | wc -c)" -le 1000 ]] || { echo 'bench-startup: --text must stay under 1000 bytes' >&2; exit 65; }
+
+data="${TTS_DATA_DIR:-$HOME/.local/share/omarchy-tts}"
+engine="$data/engines/kokoro"
+models="${KOKORO_MODELS:-$engine/models}"
+kpy="${KOKORO_PYTHON:-$engine/bin/python}"
+
+if [[ ! -x "$kpy" ]]; then
+  echo 'bench-startup: kokoro is not installed; install it from the Provider tab first' >&2
+  exit 127
+fi
+
+# providers/kokoro refuses any environment this release did not build from its
+# shipped lock; the benchmark reports the same condition before timing a thing.
+if [[ -z "${KOKORO_PYTHON:-}" ]] &&
+   [[ "$(cat "$engine/.lock-sha256" 2>/dev/null)" != "$(sha256sum "$lock" | cut -d' ' -f1)" ]]; then
+  echo 'bench-startup: note: engine was installed by an earlier release; numbers may not match the shipped lock' >&2
+fi
+
+config="${TTS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-tts/config.json}"
+if [[ -z "$voice" ]]; then
+  voice="$(jq -r '.kokoro.voice // "af_heart"' "$config" 2>/dev/null)" || voice="af_heart"
+  [[ "$voice" == "null" ]] && voice="af_heart"
+fi
+[[ "$voice" =~ ^[a-z]{2}_[a-z]+$ ]] || { echo 'bench-startup: invalid voice name' >&2; exit 65; }
+
+probe_file="$(mktemp "${TMPDIR:-/tmp}/omarchy-tts-bench.probe.XXXXXX")"
+error_file="$(mktemp "${TMPDIR:-/tmp}/omarchy-tts-bench.error.XXXXXX")"
+text_file="$(mktemp "${TMPDIR:-/tmp}/omarchy-tts-bench.text.XXXXXX")"
+trap 'rm -f "$probe_file" "$error_file" "$text_file"' EXIT
+printf '%s' "$text" > "$text_file"
+
+s() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.3f", b - a }'; }
+
+# == Stage one: the sha256 verify, exactly what providers/kokoro pays on every
+# synthesis before Python even starts. Phase 1 of the latency plan moves this
+# to install time, so its cost is measured here, once, out in the open.
+verify_time() { # <relative path>
+  local want file t0 got cost
+  want="$(jq -r --arg f "$1" '.kokoro.files[$f].sha256 // empty' "$manifest" 2>/dev/null)"
+  [[ "$want" =~ ^[0-9a-f]{64}$ ]] || { echo 'bench-startup: manifest has no verified digest for the model files' >&2; exit 65; }
+  file="$models/$1"
+  [[ -f "$file" && ! -L "$file" ]] || { echo "bench-startup: $1 is missing; install Kokoro from the Provider tab first" >&2; exit 127; }
+  t0="$(date +%s.%N)"
+  got="$(sha256sum "$file" | cut -d' ' -f1)"
+  cost="$(s "$t0" "$(date +%s.%N)")"
+  [[ "$got" == "$want" ]] || { echo "bench-startup: $1 failed verification; reinstall Kokoro from the Provider tab" >&2; exit 65; }
+  printf '  %-20s %8s s\n' "$1" "$cost"
+  VERIFY_TOTAL="$(awk -v a="$VERIFY_TOTAL" -v b="$cost" 'BEGIN { printf "%.3f", a + b }')"
+}
+VERIFY_TOTAL=0
+
+echo "== model verification (sha256; the hot-path cost Phase 1 removes) =="
+verify_time config.json
+verify_time kokoro-v1_0.pth
+verify_time "voices/$voice.pt"
+printf '  %-20s %8s s\n' 'verify total' "$VERIFY_TOTAL"
+echo
+
+# == Stage two: the instrumented synthesis. The Python mirrors providers/kokoro
+# line for line (same import order, same environment, no hub) and adds
+# monotonic probes written to a sidecar file. Audio bytes go to /dev/null.
+run_probe() {
+  local t0 event ms wall probe_failed
+  : > "$probe_file"
+  : > "$error_file"
+
+  t0="$(date +%s.%N)"
+  probe_failed=0
+  BENCH_PROBE="$probe_file" KOKORO_VOICE="$voice" KOKORO_SPEED="${TTS_RATE:-1.0}" \
+       KOKORO_MODELS="$models" PYTHONWARNINGS=ignore HF_HUB_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1 \
+       "$kpy" 3<"$text_file" - <<'KOKORO_PY' >/dev/null 2>"$error_file" || probe_failed=1
+import os, sys, time, warnings
+warnings.filterwarnings("ignore")
+
+# Monotonic probes: one tab-separated line per named event, elapsed
+# milliseconds since the interpreter began executing this script.
+probe_path = os.environ["BENCH_PROBE"]
+T0 = time.perf_counter()
+
+def probe(event):
+    with open(probe_path, "a", encoding="utf-8") as sink:
+        sink.write("%s\t%.1f\n" % (event, (time.perf_counter() - T0) * 1000))
+
+probe("boot")
+import numpy as np
+probe("numpy")
+import torch
+probe("torch")
+from kokoro import KModel, KPipeline
+probe("kokoro")
+
+models = os.environ["KOKORO_MODELS"]
+voice = os.environ.get("KOKORO_VOICE", "af_heart")
+# Local, verified files only: no repo lookup, no hub download.
+model = KModel(repo_id="hexgrad/Kokoro-82M",
+               config=os.path.join(models, "config.json"),
+               model=os.path.join(models, "kokoro-v1_0.pth")).eval()
+probe("model")
+pipe = KPipeline(lang_code=voice[0], repo_id="hexgrad/Kokoro-82M", model=model)
+pack = torch.load(os.path.join(models, "voices", voice + ".pt"), weights_only=True)
+probe("pipeline")
+with os.fdopen(3, encoding="utf-8") as source:
+    text = source.read()
+probe("text-read")
+
+sink = open(os.devnull, "wb")
+for i, (_, _, audio) in enumerate(pipe(text, voice=pack,
+                                       speed=float(os.environ.get("KOKORO_SPEED", "1.0")))):
+    # kokoro yields a torch Tensor, which has no .astype; convert first.
+    if hasattr(audio, "detach"):
+        audio = audio.detach().cpu().numpy()
+    samples = np.clip(np.asarray(audio, dtype="float32"), -1.0, 1.0)
+    sink.write((samples * 32767.0).astype("<i2").tobytes())
+    sink.flush()
+    probe("first-audio" if i == 0 else "chunk")
+sink.close()
+probe("done")
+KOKORO_PY
+  wall="$(s "$t0" "$(date +%s.%N)")"
+
+  if [[ "$probe_failed" -ne 0 ]]; then
+    echo 'bench-startup: instrumented synthesis failed:' >&2
+    tail -n 20 "$error_file" >&2
+    exit 65
+  fi
+
+  local first total chunks=0 name
+  first=""
+  while IFS=$'\t' read -r event ms; do
+    case "$event" in
+      numpy|kokoro|torch|model|pipeline)
+        name="$event" ;;
+      first-audio)
+        name="phonemize→first audio"
+        first="$ms"
+        chunks=1 ;;
+      done)
+        name="synthesis total"
+        total="$ms" ;;
+      chunk)
+        chunks=$((chunks + 1))
+        continue ;;
+      *)
+        continue ;;
+    esac
+    printf '  %-24s %8s s\n' "$name" "$(awk -v ms="$ms" 'BEGIN { printf "%.3f", ms / 1000 }')"
+  done < "$probe_file"
+
+  [[ -n "$first" && -n "$total" ]] || { echo 'bench-startup: run produced no probes' >&2; exit 65; }
+
+  printf '  %-24s %8d\n' "audio chunks emitted" "$chunks"
+  printf '  %-24s %8s s\n' 'python wall clock (bash)' "$wall"
+
+  BOOT="$(date +%s.%N)"
+  if ! "$kpy" -c pass >/dev/null 2>&1; then
+    echo 'bench-startup: engine interpreter failed to start' >&2
+    exit 127
+  fi
+  boot="$(s "$BOOT" "$(date +%s.%N)")"
+  printf '  %-24s %8s s\n' 'interpreter boot (bash)' "$boot"
+
+  spawn_first="$(awk -v boot="$boot" -v ms="$first" 'BEGIN { printf "%.3f", boot + ms / 1000 }')"
+  spawn_done="$(awk -v boot="$boot" -v ms="$total" 'BEGIN { printf "%.3f", boot + ms / 1000 }')"
+  printf '  %-24s %8s s\n' 'spawn → first audio' "$spawn_first"
+  printf '  %-24s %8s s\n' 'spawn → done' "$spawn_done"
+  printf '  %-24s %8s s\n' 'exit ≥ done (teardown)' "$(awk -v w="$wall" -v d="$spawn_done" 'BEGIN { printf "%.3f", w - d }')"
+
+  if [[ -z "$best_first" ]] || awk -v a="$spawn_first" -v b="$best_first" 'BEGIN { exit !(a < b) }'; then
+    best_first="$spawn_first"; best_done="$spawn_done"; best_wall="$wall"
+  fi
+  run=$((run + 1))
+}
+
+chunks=0
+best_first=""
+best_done=""
+best_wall=""
+
+printf '== synthesis probes (voice %s, %s bytes, %s runs) ==\n' "$voice" "$(wc -c < "$text_file")" "$runs"
+run=1
+while [[ "$run" -le "$runs" ]]; do
+  echo "-- run $run --"
+  run_probe
+done
+echo
+
+if [[ "$runs" -gt 1 ]]; then
+  echo "== summary (best of $runs) =="
+else
+  echo "== summary =="
+fi
+printf '  per-press sha256 verify hot-path %7s s\n' "$VERIFY_TOTAL"
+printf '  best spawn → first audio         %7s s\n' "$best_first"
+printf '  best spawn → done                %7s s\n' "$best_done"

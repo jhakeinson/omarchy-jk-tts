@@ -67,11 +67,13 @@ call, never resolved from `PATH`. Engines are built with `uv` into isolated
 environments under `~/.local/share/omarchy-tts/` from complete, hash-pinned
 dependency locks shipped in the plugin (`lib/engines/*.lock`, applied with
 `uv pip sync --require-hashes`): Piper (`piper-tts==1.7.0`), Kokoro
-(`kokoro==0.9.4` with its spaCy model wheel) and EasyOCR (`easyocr==1.7.2`),
+(`kokoro==0.9.4` with its spaCy model wheel), Kokoro fp32 ONNX
+(`kokoro-onnx` with `onnxruntime`) and EasyOCR (`easyocr==1.7.2`),
 all on Python 3.12 (`uv` fetches a checksummed interpreter if the system has
 none). Model artefacts are pinned too: Piper voices
 come from one revision of `rhasspy/piper-voices`, Kokoro's model, config and
-voices from one revision of `hexgrad/Kokoro-82M`, and EasyOCR's recognition
+voices from one revision of `hexgrad/Kokoro-82M` (the fp32 ONNX build for the
+ONNX engine), and EasyOCR's recognition
 models from fixed release archives, each verified against a SHA-256 shipped in
 the plugin when downloaded and again before it is loaded. Every engine
 environment records the lock that built it, so engines installed by a release
@@ -89,6 +91,29 @@ to download on its own.
 | `SUPER+ALT+R` | **Drag a box, hear the text in it** (OCR) |
 | `SUPER+ALT+W` | Read the focused window — no pointer needed |
 | `SUPER+ALT+SHIFT+R` | Read the whole screen — no pointer needed |
+
+## Speed
+
+Two cooperating optimizations make repeat presses near-instant; both are
+pure optimizations and the plugin speaks exactly the same without them.
+
+- **Resident daemon.** The heavy local engines (Kokoro, Kokoro fp32 ONNX)
+  keep one process with the model loaded across key presses, started on
+  demand from a systemd user socket unit and self-quitting after ten idle
+  minutes. A press streams text to that process over a private, owner-only
+  unix socket instead of booting an engine (~0.86 s warm for Kokoro, from
+  ~5.3 s). Full verification still happens before every press, and the
+  daemon re-checks its engine fingerprint so a replaced install can never
+  serve stale files.
+- **Synthesis cache.** Whatever a press commits is stored under
+  `~/.cache/omarchy-tts/audio/` keyed by engine, voice, speed and the exact
+  text; the same press again is a file read (~0.04 s, ~100× faster than
+  live synthesis). Entries are owner-only, never partial (a cancelled press
+  stores nothing) and bounded (LRU, 256 MB, 30 days).
+
+Knobs: `TTS_DAEMON=0` disables the daemon, `TTS_CACHE=0` disables the cache,
+`TTS_CACHE_LIMIT_MB` (default 256) and `TTS_CACHE_TTL_DAYS` (default 30)
+bound the store, and `speak --info` shows what each is doing right now.
 
 ## CLI
 

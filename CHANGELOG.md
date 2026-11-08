@@ -5,6 +5,43 @@ Versioning.
 
 ## Unreleased
 
+## 1.4.0 - 2026-11-08
+
+- Cut the keypress → first-audio latency of the heavy local engines by more
+  than a hundredfold for repeated phrases, in two coordinated layers:
+  - A resident synthesis daemon (`bin/speak-daemon`) keeps one engine process
+    per heavy engine with the model loaded across key presses, listening on a
+    private per-user unix socket started on demand by a systemd user socket
+    unit. Providers try the daemon first, after full fingerprint
+    verification, and fall back to inline synthesis before the first audio
+    byte on any refusal, so the daemon is an optimization and never a
+    dependency. Warm key presses drop from ~5.3 s inline to ~0.86 s (torch)
+    and ~0.49 s (ONNX fp32) end to end.
+  - A synthesis result cache (`lib/cache.sh`) keyed on (engine, voice,
+    speed, exact text bytes) stores committed presses under
+    `~/.cache/omarchy-tts/audio/` (owner-only, 0600) with refresh-on-hit LRU
+    (256 MB, 30 days) and renames audio into place only after a clean press,
+    so cancelled or failed presses are never cached; repeated phrases play
+    from disk in ~0.04 s. `TTS_CACHE=0` opts out; `TTS_CACHE_LIMIT_MB` and
+    `TTS_CACHE_TTL_DAYS` bound it; `speak --verify` bypasses it so health
+    checks keep proving real synthesis.
+- Add an fp32 ONNX Kokoro engine (`kokoro-onnx`, pinned `kokoro-v1.0.onnx` +
+  `voices-v1.0.bin`) installed from a hash-pinned lock exactly like the
+  PyTorch engine. The int8 variant the plan originally pinned was measured
+  during bring-up and rejected: quantized kernels synthesized ~4.2× slower
+  than fp32 (7.11 s vs 1.70 s first batch), larger than the startup they
+  save; the fp32 ONNX engine keeps torch's synthesis speed while dropping
+  the torch import and model-load phase entirely.
+- Publish the verification record each press builds for a heavy engine
+  (digest + file fingerprint of every verified model file) under
+  `engines/<engine>/.verified` (owner-only, atomic), so a press whose record
+  is current pays two `stat` calls instead of full model digests. Any drift
+  in the fingerprint triggers a cheap sha256 re-check and, on a pass, a
+  republished record.
+- Extend `speak --info` with a `latency` object: per-engine daemon socket
+  liveness plus the cache's enabled state and store size, so the settings
+  panel can show what each optimization is actually doing.
+
 ## 1.3.2 - 2026-09-06
 
 - Resolve `pkexec` and `pacman` at fixed canonical paths and admit them across

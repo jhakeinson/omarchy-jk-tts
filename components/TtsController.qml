@@ -211,7 +211,7 @@ Item {
     setupStartProc.running = true
   }
   function installProvider(provider) {
-    var targets = ({ "piper": "piper", "kokoro": "kokoro", "easyocr": "easyocr" })
+    var targets = ({ "piper": "piper", "kokoro": "kokoro", "kokoro-onnx": "kokoro-onnx", "easyocr": "easyocr" })
     if (targets[provider]) startSetup(targets[provider])
   }
   function cancelSetup() { if (setupCancellable) action([setupBin, "cancel"]) }

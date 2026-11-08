@@ -397,7 +397,7 @@ verify_provider() { # verify_provider <name>
   # shellcheck disable=SC2016  # $0 must expand in the inner shell, not here
   timeout --kill-after=5s 90s env TTS_VOICE="$verify_voice" TTS_RATE=1.0 TTS_SILENT=1 \
       TTS_PLUGIN_DIR="$PLUGIN_DIR" TTS_CONFIG="$CONFIG" TTS_DATA_DIR="$DATA_DIR" \
-      TTS_METRICS_FILE="$CLOUD_DIR/$name.json" TTS_INPUT_CHARS=5 \
+      TTS_METRICS_FILE="$CLOUD_DIR/$name.json" TTS_INPUT_CHARS=5 TTS_CACHE=0 TTS_DAEMON=0 \
       bash -c 'exec "$0"' "$bin" <<< "Test." >/dev/null 2>"$error_file" || rc=$?
   if [[ $rc -eq 0 ]]; then
     rm -f "$error_file"
@@ -450,7 +450,7 @@ voice_for_provider() { # voice_for_provider <name>
       voice="$(cfg .elevenlabs.voiceId "")"
       [[ -n "$voice" ]] || voice="$(cached_remote_voices elevenlabs | jq -r '.[0].value // empty')"
       ;;
-    kokoro) voice="$(cfg .kokoro.voice af_heart)" ;;
+    kokoro|kokoro-onnx) voice="$(cfg .kokoro.voice af_heart)" ;;
     gemini) voice="$(cfg .gemini.voice Kore)" ;;
     google)
       voice="$(cfg .google.voice "")"
@@ -743,7 +743,7 @@ emit_info() {
       if [[ -n "$voice" ]] && ! jq -e 'length > 0' <<< "$vs" >/dev/null 2>&1; then
         vs="$(jq -nc --arg v "$voice" '[{value:$v, label:$v}]')"
       fi ;;
-    kokoro)
+    kokoro|kokoro-onnx)
       voice="$(voice_for_provider kokoro)"; voice_path=.kokoro.voice
       vs='["af_heart","af_bella","af_nicole","af_sarah","am_adam","am_michael","bf_emma","bf_isabella","bm_george","bm_lewis"]' ;;
     gemini)
@@ -763,6 +763,36 @@ emit_info() {
   # The voice list goes through a descriptor, not an argument: a cloud
   # provider can list two thousand voices, which is past the single-argument
   # limit and would make --info fail only for the accounts with the most.
+  local latency
+  latency="$(
+    # What the resident daemon and the synthesis cache look like right now:
+    # whether each daemon socket has a live listener, and how much of the
+    # replay cache is stored. Read-only, cheap, no engine is touched.
+    local daemon_path
+    daemon_path="${XDG_RUNTIME_DIR:-}${XDG_RUNTIME_DIR:+/omarchy-tts}"
+    [[ -z "${XDG_RUNTIME_DIR:-}" ]] &&
+      daemon_path="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-tts/run"
+    local daemon
+    daemon="$(for engine in kokoro kokoro-onnx; do
+                printf '%s=%s\n' "$engine" \
+                  "$([[ -S "$daemon_path/$engine.sock" ]] && echo true || echo false)"
+              done | jq -Rn 'reduce inputs as $line ({};
+                .[($line | split("=")[0])] = (($line | split("=")[1]) == "true"))')"
+    local cache_dir cache_size cache_count
+    cache_dir="${TTS_CACHE_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}}/omarchy-tts/audio"
+    cache_count=0
+    cache_size=0
+    if [[ -d "$cache_dir" && ! -L "$cache_dir" ]]; then
+      read -r cache_count cache_size < <(find "$cache_dir" -maxdepth 1 -name '*.pcm' -printf '%s\n' \
+        | awk '{c++; s+=$1} END{printf "%d %d", c, s+0}')
+    fi
+    jq -nc --argjson daemon "$daemon" \
+      --argjson cacheEnabled "$([[ "${TTS_CACHE:-1}" != "0" ]] && echo true || echo false)" \
+      --argjson cacheEntries "$cache_count" \
+      --argjson cacheBytes "$cache_size" \
+      '{daemon:$daemon,
+        cache:{enabled:$cacheEnabled, entries:$cacheEntries, bytes:$cacheBytes}}'
+  )"
   jq -nc \
     --argjson providers "$provs" \
     --slurpfile voicesFile <(printf '%s\n' "$vs") \
@@ -772,9 +802,11 @@ emit_info() {
     --argjson ocrLanguages "$(ocr_languages "$(jq -r '.ocr.engine // "tesseract"' <<< "$config")")" \
     --argjson ocrEngines "$engines" \
     --argjson speaking "$speaking" \
+    --argjson latency "$latency" \
     '{provider:($config.provider // "piper"), voice:$voice, voicePath:$voicePath,
       rate:($config.rate // 1.0), maxChars:($config.maxChars // 0),
       speaking:$speaking, providers:$providers, voices:$voicesFile[0],
+      latency:$latency,
       ocr:{engine:($config.ocr.engine // "tesseract"),
         langs:(($config.ocr.engine // "tesseract") as $e
                | $config.ocr[$e].langs // (if $e == "tesseract" then $config.ocr.langs else null end) // "eng"),

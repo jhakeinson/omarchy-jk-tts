@@ -9,7 +9,12 @@ and testable.
 - `bin/speak` is the public speech and settings API.
 - `lib/config.sh` owns schema migration, validation and atomic config writes.
 - `lib/health.sh` owns shared, atomic health-cache invalidation.
+- `lib/cache.sh` owns the synthesis result cache: keying, staged commits,
+  LRU/TTL eviction and refusal of unsafe cache locations.
 - `lib/sanitize.py` is the one sanitizer used for speech and live preview.
+- `bin/speak-daemon` owns resident synthesis for the heavy local engines:
+  request validation, peer credentials, per-request engine fingerprint
+  checks and the backend implementations (torch, fp32 ONNX).
 - provider executables declare small metadata headers consumed by `--info`.
 - `bin/speak-voice` owns Piper catalogue/download lifecycle.
 - `bin/speak-bindings` owns only the text between its markers in
@@ -62,6 +67,44 @@ activation records a private recovery journal before replacing a proven
 generation; voice repair stages and verifies both the model and sidecar before
 publishing the pair under the same lock Piper holds while reading them. A later
 invocation repairs artifacts left by abrupt process death or power loss.
+
+### Resident daemon
+
+`bin/speak-daemon` is a Python stdlib process per heavy engine, started on
+demand by `omarchy-tts-<engine>.socket` (a systemd user socket unit; the
+daemon inherits the listener as fd 3) and parked after `--idle-exit` (600 s)
+of silence. The win: torch's ~3.2 s model load is paid once per idle window
+instead of once per press. Protocol: one JSON request line
+`{voice, speed, text}`, then raw s16le PCM at 24 kHz until the daemon closes
+the connection — the provider contract shared with inline synthesis, so the
+daemon is invisible above the provider layer.
+
+Safety posture: `SO_PEERCRED` admits only the owner; requests are bounded
+(1 MiB header, 200k characters); a symlinked socket path is refused; the
+engine install fingerprint loaded into the daemon is re-checked with a `stat`
+every request and any change ends the daemon so the next press starts against
+freshly verified files. Providers reach it only after their own full replay
+of the verification rung, and always fall back to inline synthesis if the
+daemon refuses the request before the first audio byte. A hand-supplied
+interpreter (`KOKORO_PYTHON`/`KOKORO_ONNX_PYTHON`) skips the daemon by
+design: those are verify/experiment runs, not release-managed engines.
+
+### Synthesis cache
+
+`lib/cache.sh` (sourced by the local providers) stores committed presses in
+`~/.cache/omarchy-tts/audio/` keyed `sha256(provider ∥ voice ∥ rate ∥ text
+bytes)`. Keyed presses read stdin into a private temp file first so the key,
+the daemon request and the inline synthesis all see identical bytes. Audio
+stages under `.inflight-<key>.part` while synthesizing and is renamed in
+place only when its whole pipeline exits 0 (`mv` is atomic), so a cancelled
+or failed press never caches partial audio; an empty stage is refused too.
+The directory is 0700, entries 0600, symlinked directories and entries
+refused. Hits refresh mtime (that is the LRU order and the freshness clock),
+and `audio_cache_trim` drops expired entries then the oldest past
+`TTS_CACHE_LIMIT_MB` (256 MB) / `TTS_CACHE_TTL_DAYS` (30). `TTS_CACHE=0`
+disables it; `speak --verify` sets it and `TTS_DAEMON=0` together so health
+checks always exercise real synthesis. Cloud providers are never cached:
+their output can change server-side under the same voice id.
 
 ## Deliberate design changes
 
