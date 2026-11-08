@@ -4,7 +4,7 @@ import qs.Ui
 
 BarWidget {
   id: root
-  moduleName: "io.github.hikari112.tts"
+  moduleName: "io.github.jhakeinson.tts"
 
   property bool speaking: false
   property string provider: "piper"

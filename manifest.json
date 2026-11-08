@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "id": "io.github.hikari112.tts",
+  "id": "io.github.jhakeinson.tts",
   "name": "Text to Speech",
   "version": "1.4.1",
-  "author": "hikari",
+  "author": "jhakeinson",
   "license": "MIT",
   "description": "On-demand, local-first speech for selected text and anything visible on screen",
   "kinds": [

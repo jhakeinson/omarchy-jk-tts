@@ -25,7 +25,7 @@ os.umask(0o077)
 
 BEGIN = "-- >>> omarchy-tts bindings"
 END = "-- <<< omarchy-tts bindings"
-PLUGIN_ID = "io.github.hikari112.tts"
+PLUGIN_ID = "io.github.jhakeinson.tts"
 BINDINGS_CONFIG_MAX_BYTES = 1_048_576
 BINDINGS_SOURCE_MAX_BYTES = 8_388_608
 

@@ -8,7 +8,7 @@ import "components"
 
 Panel {
   id: root
-  moduleName: "io.github.hikari112.tts"
+  moduleName: "io.github.jhakeinson.tts"
   ipcTarget: moduleName
   manageIpc: false
 

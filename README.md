@@ -348,7 +348,7 @@ Before removing the plugin, use **Keys → Remove shortcuts** so no shortcuts
 are left behind, and remove cloud keys from the Provider tab if desired. Then:
 
 ```bash
-omarchy plugin remove io.github.hikari112.tts
+omarchy plugin remove io.github.jhakeinson.tts
 ```
 
 Removal deliberately leaves downloaded engines, voice models, settings, and
@@ -375,7 +375,7 @@ you the word "hash", not thirty seconds of hex.
 Test it standalone:
 
 ```bash
-cat something.md | python3 ~/.config/omarchy/plugins/io.github.hikari112.tts/lib/sanitize.py
+cat something.md | python3 ~/.config/omarchy/plugins/io.github.jhakeinson.tts/lib/sanitize.py
 ```
 
 ## Development
@@ -392,7 +392,7 @@ to Omarchy's stable plugin location:
 ```bash
 git clone https://github.com/jhakeinson/omarchy-jk-tts.git
 ln -s "$PWD/omarchy-tts" \
-  "${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/io.github.hikari112.tts"
+  "${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/io.github.jhakeinson.tts"
 ```
 
 Saving a file in the clone then reloads the widget. The link command

@@ -710,7 +710,7 @@ class CliConfigTests(unittest.TestCase):
 
     def test_managed_bindings_follow_the_stable_plugin_symlink(self):
         plugin = Path(self.temp.name, "omarchy", "plugins",
-                      "io.github.hikari112.tts")
+                      "io.github.jhakeinson.tts")
         first = Path(self.temp.name, "checkout-a")
         second = Path(self.temp.name, "checkout-b")
         for checkout in (first, second):

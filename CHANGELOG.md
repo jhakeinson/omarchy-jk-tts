@@ -5,6 +5,14 @@ Versioning.
 
 ## Unreleased
 
+- Rebranded the plugin id and QML module name to
+  `io.github.jhakeinson.tts` for the standalone repository. A local install
+  migrates by renaming its plugin directory; engines, voice packs and the
+  synthesis cache live under brand-neutral `omarchy-tts` paths and move
+  nothing. The keybind bindings tool resolves the plugin through the stable
+  `<PLUGIN_ID>` path constant, so managed launchers survive the rename
+  wherever the directory is updated to the new id.
+
 ## 1.4.1 - 2026-11-08
 
 - Fixed the panel rendering almost unreadable on themed machines: bare `Color`
@@ -19,9 +27,9 @@ Versioning.
 - Fixed the kokoro-onnx install flow dying with `curl: (23)` (the models
   directory was never created before curl staged its download).
 - Published as the standalone `jhakeinson/omarchy-jk-tts` repository, with
-  install and CI badge links pointed there. The plugin id
-  (`io.github.hikari112.tts`) is unchanged so existing installs keep their
-  configuration, engine directories and systemd unit names.
+  install and CI badge links pointed there. At release time the plugin id
+  (`io.github.jhakeinson.tts`) kept the original's namespace so the change
+  was not mixed into fixing the panel and install flows.
 
 ## 1.4.0 - 2026-11-08
 
