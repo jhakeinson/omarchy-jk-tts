@@ -73,6 +73,40 @@ const OmarchyTtsText = (function () {
   }
 
   /*
+   * Chrome's visible selection skips text that is not being rendered, and a
+   * DOM Range still intersects it. Inline <script>/<style> data in particular
+   * is full of base64 payloads that the TTS engine would otherwise read
+   * aloud, so only text nodes with a rendered ancestor may join the map.
+   */
+  var UNRENDERED_TAGS = /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|HEAD)$/;
+
+  function isRenderedTextNode(node, cache) {
+    var doc = node.ownerDocument;
+    var element = node.parentElement;
+    while (element && element !== doc.documentElement) {
+      if (UNRENDERED_TAGS.test(element.tagName)) return false;
+      if (cache) {
+        if (cache.has(element)) {
+          if (!cache.get(element)) return false;
+        } else {
+          var rendered = true;
+          try {
+            var view = doc.defaultView;
+            var style = view && view.getComputedStyle(element);
+            rendered = !style || style.display !== 'none';
+          } catch (err) {
+            /* Detached documents have no style; keep the node. */
+          }
+          cache.set(element, rendered);
+          if (!rendered) return false;
+        }
+      }
+      element = element.parentElement;
+    }
+    return true;
+  }
+
+  /*
    * Walk the document text nodes covered by `range`, producing canonical text
    * plus a map from canonical offsets back to text nodes.
    *
@@ -92,46 +126,49 @@ const OmarchyTtsText = (function () {
     var entries = [];
     var text = '';
     var truncated = false;
+    var rendered = new Map();
     var node = walker.nextNode();
 
     while (node) {
-      var hit = intersectTextNode(range, node);
-      if (hit) {
-        var piece = node.data.slice(hit.start, hit.end);
-        var block = blockAncestor(node);
-        var previous = entries.length ? entries[entries.length - 1] : null;
-        var separator =
-          previous &&
-          previous.block !== block &&
-          !/\s$/.test(text) &&
-          !/^\s/.test(piece)
-            ? ' '
-            : '';
-        var takeEnd = hit.end;
-        if (
-          text.length + separator.length + (takeEnd - hit.start) >
-          maxChars
-        ) {
-          takeEnd =
-            hit.start + (maxChars - text.length - separator.length);
-          truncated = true;
-        }
-        if (takeEnd > hit.start) {
-          piece = node.data.slice(hit.start, takeEnd);
-          text += separator;
-          entries.push({
-            node: node,
-            nodeStart: hit.start,
-            nodeEnd: takeEnd,
-            textStart: text.length,
-            textEnd: text.length + piece.length,
-            block: block
-          });
-          text += piece;
-        }
-        if (truncated || text.length >= maxChars) {
-          truncated = true;
-          break;
+      if (isRenderedTextNode(node, rendered)) {
+        var hit = intersectTextNode(range, node);
+        if (hit) {
+          var piece = node.data.slice(hit.start, hit.end);
+          var block = blockAncestor(node);
+          var previous = entries.length ? entries[entries.length - 1] : null;
+          var separator =
+            previous &&
+            previous.block !== block &&
+            !/\s$/.test(text) &&
+            !/^\s/.test(piece)
+              ? ' '
+              : '';
+          var takeEnd = hit.end;
+          if (
+            text.length + separator.length + (takeEnd - hit.start) >
+            maxChars
+          ) {
+            takeEnd =
+              hit.start + (maxChars - text.length - separator.length);
+            truncated = true;
+          }
+          if (takeEnd > hit.start) {
+            piece = node.data.slice(hit.start, takeEnd);
+            text += separator;
+            entries.push({
+              node: node,
+              nodeStart: hit.start,
+              nodeEnd: takeEnd,
+              textStart: text.length,
+              textEnd: text.length + piece.length,
+              block: block
+            });
+            text += piece;
+          }
+          if (truncated || text.length >= maxChars) {
+            truncated = true;
+            break;
+          }
         }
       }
       node = walker.nextNode();

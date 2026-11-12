@@ -5,6 +5,14 @@ Versioning.
 
 ## Unreleased
 
+### Fixed
+- Long selections that span inline `<script>`/`<style>` content no longer read
+  base64 payloads aloud: the content script now skips text nodes that are not
+  being rendered (scripts, styles, templates, `display:none` elements), which
+  matches what the visible selection contains.
+
+## 1.0.0
+
 - Added an optional Chrome/Chromium reader for page selections. The MV3
   extension in `chrome-extension/` reads with the plugin's configured provider,
   voice and rate, plays the returned audio in the page, highlights the current
