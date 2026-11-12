@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Omarchy TTS Reader</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="popup">
+      <header class="head">
+        <div class="brand">
+          <span class="mark" aria-hidden="true">&#9654;</span>
+          <h1>Omarchy TTS</h1>
+        </div>
+        <span id="statusDot" class="dot unknown" aria-hidden="true"></span>
+      </header>
+
+      <p id="connection" class="connection" role="status">Checking bridge&hellip;</p>
+
+      <section id="info" class="info" hidden aria-label="Bridge voice">
+        <div class="info-row">
+          <span class="label">Provider</span>
+          <span id="provider" class="value">&mdash;</span>
+        </div>
+        <div class="info-row">
+          <span class="label">Voice</span>
+          <span id="voice" class="value">&mdash;</span>
+        </div>
+        <div class="info-row">
+          <span class="label">Rate</span>
+          <span id="rate" class="value">&mdash;</span>
+        </div>
+      </section>
+
+      <p id="activity" class="activity" hidden role="status"></p>
+
+      <div class="actions">
+        <button id="readBtn" class="btn primary" type="button" disabled>
+          Read selection
+        </button>
+        <button id="stopBtn" class="btn" type="button" disabled>Stop</button>
+      </div>
+
+      <p id="message" class="message" hidden role="alert"></p>
+
+      <footer class="foot">
+        <span class="hint">Alt+Shift+E read &middot; Alt+Shift+X stop</span>
+        <button id="optionsBtn" class="link" type="button">Settings</button>
+      </footer>
+    </main>
+
+    <script src="shared.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

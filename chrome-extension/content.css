@@ -1,0 +1,28 @@
+/*
+ * CSS Custom Highlight API paint styles. These live in the page's author
+ * stylesheet (content_scripts css) so they apply to page text, not the HUD.
+ */
+
+::highlight(omarchy-tts-scope) {
+  background-color: rgba(249, 115, 22, 0.16);
+  color: inherit;
+}
+
+::highlight(omarchy-tts-current) {
+  background-color: rgba(249, 115, 22, 0.58);
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: rgba(154, 52, 18, 0.65);
+  text-decoration-thickness: 1px;
+}
+
+@media (prefers-color-scheme: dark) {
+  ::highlight(omarchy-tts-scope) {
+    background-color: rgba(251, 146, 60, 0.22);
+  }
+
+  ::highlight(omarchy-tts-current) {
+    background-color: rgba(251, 146, 60, 0.7);
+    text-decoration-color: rgba(255, 237, 213, 0.8);
+  }
+}

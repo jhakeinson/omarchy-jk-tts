@@ -51,7 +51,14 @@ jobs:
           exit "$test_status"
 
       - name: Python syntax
-        run: python3 -m py_compile bin/speak-bindings bin/speak-setup lib/sanitize.py tests/*.py
+        run: python3 -m py_compile bin/speak-bridge bin/speak-bindings bin/speak-setup lib/sanitize.py tests/*.py tests/test_bridge.py
+
+      - name: Chrome extension syntax
+        run: |
+          for f in chrome-extension/*.js; do
+            node --check "$f" || exit 1
+          done
+          jq -e . chrome-extension/manifest.json > /dev/null
 
       - name: Shell syntax
         run: |
