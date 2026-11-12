@@ -824,44 +824,97 @@ const OmarchyTtsText = (function () {
     sendState(state);
   }
 
+  /*
+   * Pause is a session-level intent, not just an audio element call. It also
+   * works while the next chunk is still being synthesized or in the gap
+   * between chunks: the walker parks at the pending sentence and continues
+   * exactly there on resume.
+   */
   function pauseReading() {
-    if (!session || session.status !== 'speaking' || !session.audio) return;
-    try {
-      session.audio.pause();
-    } catch (err) {
-      /* ignore */
+    if (!session || session.status === 'done' || session.status === 'error') {
+      return;
     }
-    session.status = 'paused';
-    stopTicker();
-    sendCurrentState('paused', { progress: audioProgress() });
+    session.paused = true;
+    if (session.audio && session.status === 'speaking') {
+      try {
+        session.audio.pause();
+      } catch (err) {
+        /* ignore */
+      }
+    }
+    if (session.status !== 'paused') {
+      session.status = 'paused';
+      stopTicker();
+      sendCurrentState('paused', { progress: audioProgress() });
+    }
   }
 
   function resumeReading() {
-    if (!session || session.status !== 'paused' || !session.audio) return;
+    if (!session || !session.paused) return;
+    session.paused = false;
     var gen = session.generation;
+
     var audio = session.audio;
-    audio.play().then(
-      function () {
-        if (!isCurrent(gen)) return;
-        session.status = 'speaking';
-        var progress = 0;
-        if (isFinite(audio.duration) && audio.duration > 0) {
-          progress = Math.max(
-            0,
-            Math.min(1, audio.currentTime / audio.duration)
-          );
+    if (audio) {
+      /* Mid-sentence pause: the element continues from the same position. */
+      audio.play().then(
+        function () {
+          if (!isCurrent(gen)) return;
+          if (applyPauseIfWanted(gen)) return;
+          session.status = 'speaking';
+          var progress = 0;
+          if (isFinite(audio.duration) && audio.duration > 0) {
+            progress = Math.max(
+              0,
+              Math.min(1, audio.currentTime / audio.duration)
+            );
+          }
+          sendCurrentState('speaking', { progress: progress });
+          startTicker(gen);
+        },
+        function () {
+          if (!isCurrent(gen)) return;
+          session.paused = true;
+          session.status = 'paused';
+          sendCurrentState('paused', {
+            message:
+              'Audio is still blocked. Click Resume again, or allow audio for this site.'
+          });
         }
-        sendCurrentState('speaking', { progress: progress });
-        startTicker(gen);
-      },
-      function () {
-        if (!isCurrent(gen)) return;
-        sendCurrentState('paused', {
-          message:
-            'Audio is still blocked. Click Resume again, or allow audio for this site.'
-        });
+      );
+      return;
+    }
+
+    /* No audio yet: the walker was parked before a chunk. Continue there. */
+    var pending =
+      typeof session.pendingIndex === 'number'
+        ? session.pendingIndex
+        : session.index + 1;
+    session.pendingIndex = null;
+    if (pending < 0 || pending >= session.chunks.length) {
+      finishReading();
+      return;
+    }
+    playIndex(pending, gen);
+  }
+
+  /*
+   * A pause request can land while playback is still being started (the
+   * play() promise has not settled yet). Honor it immediately instead of
+   * letting the speaking state clobber it.
+   */
+  function applyPauseIfWanted(gen) {
+    if (!isCurrent(gen) || !session || !session.paused) return false;
+    if (session.audio) {
+      try {
+        session.audio.pause();
+      } catch (err) {
+        /* ignore */
       }
-    );
+    }
+    session.status = 'paused';
+    sendCurrentState('paused', { progress: audioProgress() });
+    return true;
   }
 
   function onChunkEnded(i, gen) {
@@ -882,6 +935,17 @@ const OmarchyTtsText = (function () {
       return;
     }
 
+    if (session.paused) {
+      /* Park the walker here; resumeReading continues from this chunk.
+       * Point the position and highlight at the pending sentence, so the
+       * paused state always names the sentence playback will resume on. */
+      session.pendingIndex = i;
+      session.index = i;
+      showChunk(i, gen);
+      sendCurrentState('paused', { progress: 0 });
+      return;
+    }
+
     session.index = i;
     session.status = i === 0 ? 'preparing' : 'speaking';
     showChunk(i, gen);
@@ -898,6 +962,14 @@ const OmarchyTtsText = (function () {
       return;
     }
     if (!isCurrent(gen) || !session) return;
+
+    if (session.paused) {
+      /* Pause landed while this chunk was being synthesized. Keep it cached
+       * so resume does not pay for a second synthesis. */
+      session.pendingIndex = i;
+      sendCurrentState('paused', { progress: 0 });
+      return;
+    }
 
     session.cache.delete(i);
 
@@ -979,6 +1051,7 @@ const OmarchyTtsText = (function () {
     }
 
     if (!isCurrent(gen) || !session) return;
+    if (applyPauseIfWanted(gen)) return;
     session.status = 'speaking';
     sendCurrentState('speaking', { progress: 0 });
     startTicker(gen);
@@ -996,13 +1069,14 @@ const OmarchyTtsText = (function () {
     notifyBackground({
       type: 'READ_STARTED',
       total: total,
+      paused: session.paused === true,
       provider: session.provider,
       voice: session.voice,
       rate: session.rate
     });
 
     sendState(
-      buildState('preparing', {
+      buildState(session.paused ? 'paused' : 'preparing', {
         message: notes.length ? notes.join(' ') : undefined
       })
     );
@@ -1065,6 +1139,8 @@ const OmarchyTtsText = (function () {
       chunks: chunks,
       index: -1,
       status: 'preparing',
+      paused: false,
+      pendingIndex: null,
       provider: null,
       voice: null,
       rate: null,
@@ -1518,7 +1594,8 @@ const OmarchyTtsText = (function () {
       if (h.message.textContent) h.message.textContent = '';
     }
 
-    var canPause = status === 'speaking' || status === 'paused';
+    var canPause =
+      status === 'speaking' || status === 'paused' || status === 'preparing';
     h.pauseBtn.hidden = !canPause;
     h.pauseBtn.disabled = !canPause;
     h.pauseBtn.textContent = status === 'paused' ? 'Resume' : 'Pause';
@@ -1537,6 +1614,9 @@ const OmarchyTtsText = (function () {
       pauseReading();
     } else if (action === 'resume') {
       resumeReading();
+    } else if (action === 'toggle-pause') {
+      if (session && session.paused) resumeReading();
+      else pauseReading();
     } else if (action === 'stop' || action === 'close') {
       stopReadingInternal();
     }

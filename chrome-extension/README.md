@@ -29,6 +29,7 @@ Chrome may ask to confirm the keyboard shortcuts. The defaults are:
 | Action | Shortcut |
 | --- | --- |
 | Read selection | `Alt+Shift+E` |
+| Pause / resume reading | `Alt+Shift+P` |
 | Stop reading | `Alt+Shift+X` |
 | Open popup | `Alt+Shift+R` |
 
@@ -63,6 +64,13 @@ and update the URL in Settings. No other host is accepted by this extension.
   choose **Read selection aloud**.
 - The top frame shows a floating HUD with the provider/voice/rate, the current
   sentence, "Sentence i of N", progress, and Pause/Resume/Stop controls.
+- Pause works anywhere in a read, including while the next sentence is still
+  being synthesized: the reader parks at the sentence playback will resume on,
+  and resume continues exactly there (mid-sentence audio keeps its position;
+  a sentence that finished synthesizing while paused is not synthesized
+  again).
+- Pause/resume is available from the HUD, the popup, the `Alt+Shift+P`
+  shortcut, and the context menu ("Pause reading" / "Resume reading").
 - The selection is split into sentence-sized chunks. Each chunk is synthesized
   just before it plays, and the next chunk is prefetched while the current one
   plays.
@@ -96,7 +104,7 @@ message shapes, statuses, timeouts, and error handling.
 
 | Permission | Why |
 | --- | --- |
-| `contextMenus` | "Read selection aloud" / "Stop reading" menu items. |
+| `contextMenus` | "Read selection aloud", "Pause/Resume reading" and "Stop reading" menu items. |
 | `storage` | Bridge URL/token in `local`, active read in `session`. |
 | `scripting` | Probe frames for a selection when starting from the popup/shortcut. |
 | `activeTab` | Read the page the user explicitly invoked the extension on. |

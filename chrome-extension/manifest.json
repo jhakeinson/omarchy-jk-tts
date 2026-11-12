@@ -44,6 +44,12 @@
       },
       "description": "Stop reading"
     },
+    "toggle-pause": {
+      "suggested_key": {
+        "default": "Alt+Shift+P"
+      },
+      "description": "Pause or resume reading"
+    },
     "_execute_action": {
       "suggested_key": {
         "default": "Alt+Shift+R"

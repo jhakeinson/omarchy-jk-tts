@@ -5,6 +5,16 @@ Versioning.
 
 ## Unreleased
 
+### Added
+- Pause/resume now works anywhere in a read, and the sentence walker honors
+  it: pausing while the next sentence is still being synthesized (or in the
+  gap between sentences) parks the walker at the pending sentence, and resume
+  continues exactly there without synthesizing it twice. Mid-sentence pauses
+  keep the audio position. Pause/resume is reachable from the HUD, the popup
+  (new Pause/Resume button), a new `Alt+Shift+P` shortcut, and a new
+  "Pause reading"/"Resume reading" context menu item whose label follows the
+  playback state.
+
 ### Fixed
 - Long selections that span inline `<script>`/`<style>` content no longer read
   base64 payloads aloud: the content script now skips text nodes that are not

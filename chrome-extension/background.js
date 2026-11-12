@@ -12,6 +12,7 @@ var T = self.OmarchyTTS;
 
 var MENU_READ = 'omarchy-tts-read-selection';
 var MENU_STOP = 'omarchy-tts-stop-reading';
+var MENU_PAUSE = 'omarchy-tts-pause-reading';
 
 /* {tabId, frameId, startedAt} - mirrored in chrome.storage.session. */
 var activeRead = null;
@@ -77,6 +78,7 @@ function restoreSession() {
         if (stored.lastState && typeof stored.lastState === 'object') {
           lastState = stored.lastState;
           lastStateStatus = T.safeText(lastState.status, 20);
+          syncPauseMenu();
         }
         /* A read created while restore was pending always wins. */
         if (activeRead) return;
@@ -489,6 +491,19 @@ function rememberState(state, persist) {
   if (persist || state.status !== lastStateStatus) {
     lastStateStatus = state.status;
     persistLastState();
+    syncPauseMenu();
+  }
+}
+
+/* Keep the context menu label in step with the paused state. */
+function syncPauseMenu() {
+  var title = lastStateStatus === 'paused' ? 'Resume reading' : 'Pause reading';
+  try {
+    chrome.contextMenus.update(MENU_PAUSE, { title: title }, function () {
+      void chrome.runtime.lastError;
+    });
+  } catch (err) {
+    /* Menus may not exist yet during startup. */
   }
 }
 
@@ -778,7 +793,7 @@ async function onReadStarted(message, sender) {
   }
 
   var state = {
-    status: 'preparing',
+    status: message.paused === true ? 'paused' : 'preparing',
     index: 0,
     total: T.clampInteger(message.total, 0, 1000000) || 0,
     text: '',
@@ -880,6 +895,30 @@ async function getReadState() {
   };
 }
 
+/*
+ * Toggle pause/resume in the active reading frame. The frame decides which
+ * direction applies, because only it knows whether the walker is parked or a
+ * sentence is playing.
+ */
+async function togglePauseActive() {
+  await restoreSession();
+  if (!activeRead) {
+    return { ok: false, error: 'not_active', message: 'Nothing is reading.' };
+  }
+  var response = await sendToFrame(activeRead.tabId, activeRead.frameId, {
+    type: 'HUD_CONTROL',
+    action: 'toggle-pause'
+  });
+  if (!response) {
+    return {
+      ok: false,
+      error: 'no_content',
+      message: 'The reading frame is no longer available.'
+    };
+  }
+  return { ok: true };
+}
+
 async function testBridge(message) {
   var settings = await getSettings({
     bridgeUrl:
@@ -931,6 +970,8 @@ async function handleMessage(message, sender) {
       return onHudControl(message, sender);
     case 'GET_READ_STATE':
       return getReadState();
+    case 'PAUSE_TOGGLE':
+      return togglePauseActive();
     case 'START_READ': {
       /* Content scripts start in their own frame; popups use the active tab. */
       if (sender.tab) {
@@ -1001,6 +1042,11 @@ function createMenus() {
           title: 'Stop reading',
           contexts: ['page', 'selection']
         });
+        chrome.contextMenus.create({
+          id: MENU_PAUSE,
+          title: 'Pause reading',
+          contexts: ['page', 'selection']
+        });
         resolve();
       });
     } catch (err) {
@@ -1020,12 +1066,16 @@ chrome.contextMenus.onClicked.addListener(function (info, tab) {
     });
   } else if (info.menuItemId === MENU_STOP) {
     stopActive({ reason: 'context-menu', notify: true });
+  } else if (info.menuItemId === MENU_PAUSE) {
+    togglePauseActive();
   }
 });
 
 chrome.commands.onCommand.addListener(async function (command) {
   if (command === 'stop-reading') {
     await stopActive({ reason: 'command', notify: true });
+  } else if (command === 'toggle-pause') {
+    await togglePauseActive();
   } else if (command === 'read-selection') {
     await startFromActiveTab();
   }

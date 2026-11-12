@@ -12,6 +12,7 @@
   var rateEl = document.getElementById('rate');
   var activity = document.getElementById('activity');
   var readBtn = document.getElementById('readBtn');
+  var pauseBtn = document.getElementById('pauseBtn');
   var stopBtn = document.getElementById('stopBtn');
   var messageEl = document.getElementById('message');
   var optionsBtn = document.getElementById('optionsBtn');
@@ -63,6 +64,7 @@
   function setBusy(value) {
     busy = value;
     readBtn.disabled = value;
+    pauseBtn.disabled = value || pauseBtn.hidden;
     stopBtn.disabled = value || stopBtn.dataset.active !== '1';
   }
 
@@ -85,6 +87,8 @@
   function setActive(active) {
     stopBtn.dataset.active = active ? '1' : '0';
     stopBtn.disabled = !active || busy;
+    pauseBtn.hidden = !active;
+    pauseBtn.disabled = !active || busy;
     readBtn.textContent = active ? 'Restart reading' : 'Read selection';
   }
 
@@ -94,6 +98,7 @@
 
     if (response.active && state) {
       setActive(true);
+      pauseBtn.textContent = state.status === 'paused' ? 'Resume' : 'Pause';
       var index = T.clampInteger(state.index, 0, 1000000) || 0;
       var total = T.clampInteger(state.total, 0, 1000000) || 0;
       activity.hidden = false;
@@ -178,6 +183,17 @@
     setBusy(true);
     try {
       await sendBackground({ type: 'STOP_READ' }, 6000);
+    } finally {
+      setBusy(false);
+      refreshReadState();
+    }
+  });
+
+  pauseBtn.addEventListener('click', async function () {
+    if (busy || pauseBtn.hidden) return;
+    setBusy(true);
+    try {
+      await sendBackground({ type: 'PAUSE_TOGGLE' }, 6000);
     } finally {
       setBusy(false);
       refreshReadState();

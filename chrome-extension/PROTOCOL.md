@@ -131,7 +131,9 @@ Responses:
 ```
 
 Sent after capture/chunking. Metadata may still be `null`; it is filled in from
-the first synthesis response or a concurrent info request.
+the first synthesis response or a concurrent info request. `paused: true` is
+included when the read was paused before the first chunk could start, so the
+worker does not overwrite the paused state with `preparing`.
 
 #### `READ_STATE`
 
@@ -203,10 +205,13 @@ stop; the worker has already broadcast the stopped state.
 #### `HUD_CONTROL` (forwarded)
 
 ```js
-{ type: "HUD_CONTROL", action: "pause" | "resume" | "stop" | "close" }
+{ type: "HUD_CONTROL", action: "pause" | "resume" | "toggle-pause" | "stop" | "close" }
 ```
 
-Sent from the worker to the active reading frame after a validated HUD request.
+Sent from the worker to the active reading frame after a validated HUD
+request, or from the `toggle-pause` command, the popup's `PAUSE_TOGGLE`, or
+the context-menu pause item. `toggle-pause` lets the reading frame decide the
+direction from its own state.
 
 #### `HUD_STATE`
 
@@ -264,6 +269,18 @@ Only accepted from frame `0` of the active reading tab.
 
 Used by the popup for polling. `active` reflects the live `activeRead` record,
 not the status string.
+
+#### `PAUSE_TOGGLE`
+
+```js
+→ { ok: true }
+→ { ok: false, error: "not_active", message: "Nothing is reading." }
+```
+
+Popup origin. Toggles pause/resume in the active reading frame; the frame
+decides the direction. Also reachable through the `toggle-pause` command
+(`Alt+Shift+P`) and the "Pause reading"/"Resume reading" context menu item,
+whose label follows the last reported state.
 
 #### `START_READ` / `STOP_READ`
 
@@ -338,6 +355,23 @@ on `done`, `error`, explicit stop, tab close, and top-level navigation.
 
 Uses `info.frameId` directly (no probing). Passes `info.selectionText` as a
 fallback so a selection that collapses while the menu closes can still be read.
+
+### Pause / resume
+
+Pause is a content-script session flag, not a bridge call (a synthesis already
+in flight finishes and stays cached). At any point in the read:
+
+- While a sentence plays: the `<audio>` element pauses in place and resumes
+  from the same position.
+- While the next chunk is synthesizing, or in the gap between chunks: the
+  walker parks at the pending chunk (`pendingIndex`) and reports `paused`.
+  The parked state's `index`/highlight name the sentence playback will resume
+  on. Resume continues there without a second synthesis (the completed
+  synthesis stays cached).
+- While `preparing` (before the first chunk): the walker parks before any
+  synthesis; nothing is synthesized until resume.
+- The context menu label follows the reported state ("Pause reading" /
+  "Resume reading").
 
 ### Iframe selection
 
