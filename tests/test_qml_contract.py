@@ -47,6 +47,33 @@ class QmlContractTests(unittest.TestCase):
         self.assertIn("Keys.priority: Keys.BeforeItem", self.panel)
         self.assertIn("event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab", self.panel)
 
+    def test_browser_bridge_tab_wires_the_backend(self):
+        self.assertIn('"Keys", "Browser"]', self.panel)
+        self.assertIn("root.currentTab === 6", self.panel)
+        self.assertIn("checked: root.bridgeEnabled", self.panel)
+        self.assertIn("Qt.Key_7", self.panel)
+        self.assertIn('setConfig(".browser.enabled", value)', self.controller)
+        self.assertIn('bridgeBin, value ? "--enable" : "--disable"', self.controller)
+
+    def test_extension_path_is_click_to_copy(self):
+        # The install path is mid-elided, so it must be copyable whole with
+        # one interaction, from mouse and keyboard alike.
+        self.assertIn("function copyText(text)", self.controller)
+        self.assertIn("function copyExtensionPath()", self.panel)
+        self.assertIn("controller.copyText(root.extensionPath)", self.panel)
+        self.assertIn("Accessible.role: Accessible.Button", self.panel)
+        self.assertIn("Keys.onSpacePressed: root.copyExtensionPath()", self.panel)
+        self.assertIn("cursorShape: Qt.PointingHandCursor", self.panel)
+        self.assertIn("pathCopiedNotice", self.panel)
+
+    def test_bridge_token_is_fetched_on_demand_and_never_retained(self):
+        # The token is requested only while the Browser tab is in use, and a
+        # hidden panel never keeps it. --info (tested in test_cli.py) never
+        # carries it either.
+        self.assertIn('command: [root.bridgeBin, "--print-token"]', self.controller)
+        self.assertIn("currentTab === 6 && root.bridgeEnabled", self.panel)
+        self.assertIn('controller.bridgeToken = ""', self.panel)
+
     def test_hidden_key_dialogs_do_not_retain_credentials(self):
         self.assertIn('else keyField.text = ""', self.key_dialog)
         self.assertIn('apiProvider = ""; apiVendor = ""', self.panel)

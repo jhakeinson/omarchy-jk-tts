@@ -15,8 +15,11 @@ focused monitor, or a region you draw around otherwise unreachable text.
 
 It is on-demand, local-first, and app-independent. Piper is the on-device
 default; cloud providers are optional voices, never silent dependencies. There
-is no narration mode, required account, subscription, browser extension, or
-text import workflow.
+is no narration mode, required account, subscription, or text import workflow.
+The optional [Chrome/Chromium extension](#browser-extension) reads page
+selections in the browser and keeps this same provider, voice, rate and privacy
+model; it is a separate, opt-in add-on, not a required part of the desktop
+plugin.
 
 <p align="center">
   <img src="docs/screenshots/provider.png" alt="Omarchy TTS Provider tab showing local and optional cloud speech providers" width="620">
@@ -57,7 +60,9 @@ The base plugin uses `bash`, `wl-clipboard`, `jq`, `python3`, `flock`
 `tesseract`, `grim`, `slurp`, and optionally `hyprpicker`. Cloud providers use
 `curl`, as do voice-catalogue refreshes and downloads; secure key storage uses
 `secret-tool` (libsecret). These system tools ship with Omarchy or are installed
-from its configured Arch repositories.
+from its configured Arch repositories. The optional browser bridge needs Python
+3.11 or newer (standard library only) on the plugin side, and Chrome/Chromium
+105 or newer for the extension.
 
 The guided local-engine setup is always explicit. It may request administrator
 approval through `pkexec` to install `uv` or a `tesseract-data-*` language
@@ -266,9 +271,117 @@ paragraphs, words split across a line break are put back together, and stray
 characters from neighbouring columns are dropped. Without that, a paragraph is
 read back as one. short. burst. per. line.
 
+## Browser extension
+
+Reading a selection on a web page should not need OCR: the page already knows
+its text. The repository ships an optional Manifest V3 Chrome/Chromium reader
+(`chrome-extension/`) plus a small local bridge (`bin/speak-bridge`) that
+renders the selection through the same provider, voice and rate configured in
+the desktop plugin. The browser receives audio, not the desktop's speakers, so
+sentence highlighting, the floating HUD, pause/resume and auto-scroll follow
+playback exactly.
+
+The bridge is a Python 3.11+ standard-library HTTP server bound to
+`127.0.0.1` (default port `8787`), never a public service. It speaks through
+the plugin's own `bin/speak` and exposes only health, info, synthesize and stop
+endpoints. Every `/v1/*` request needs a bearer token.
+
+### Setup
+
+The simplest path is inside the desktop plugin: open the **TTS panel →
+Browser** tab and switch on **Enable the browser bridge**. That installs and
+starts the systemd user service, shows the pairing token, and lists the same
+steps below (including the `chrome-extension/` folder of the installed
+plugin). The panel's toggle writes the choice to the config
+(`browser.enabled`), and turning it off stops the service and keeps it from
+starting at boot.
+
+From a terminal instead:
+
+1. Start the bridge (or let systemd keep it running):
+
+   ```bash
+   cd ~/.config/omarchy/plugins/io.github.jhakeinson.tts
+   bin/speak-bridge --print-token     # copy the token
+   bin/speak-bridge --install-service # optional systemd user service
+   ```
+
+   Run `bin/speak-bridge` in the foreground instead if you prefer; use
+   `--status` to see whether it is up and enabled, `--enable` to install and
+   start the service, `--disable` to stop it and remove it from boot,
+   `--rotate-token` to invalidate a leaked token, `--print-token` to show the
+   current one, and `--version` for the bridge version. The token is stored
+   mode 0600 at
+   `${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-tts/browser-token`.
+
+2. Load the extension unpacked: open `chrome://extensions`, enable **Developer
+   mode**, choose **Load unpacked**, and select the repository's
+   `chrome-extension/` directory. Chrome 105 or newer is required.
+
+3. Open the extension's options page, leave the bridge URL at
+   `http://127.0.0.1:8787` (or point it at another loopback port you started),
+   paste the token, press **Test connection**, then **Save**.
+
+### Using it
+
+| Shortcut | Action |
+|---|---|
+| `Alt+Shift+E` | Read the current selection aloud |
+| `Alt+Shift+X` | Stop reading |
+| `Alt+Shift+R` | Open the extension popup |
+
+The right-click menu also offers **Read selection aloud** and **Stop reading**.
+Shortcuts can be reassigned at `chrome://extensions/shortcuts`. While a read is
+active the top frame shows a floating HUD with provider, voice, rate, the
+current sentence, "Sentence i of N", a progress bar, and Pause/Resume, Stop and
+settings controls. The reading tab carries a `▶` badge. Starting another read
+stops the previous one; there is only ever one active read.
+
+### Limitations
+
+- `chrome://` pages, the Chrome Web Store, and Chrome's built-in PDF viewer do
+  not allow content scripts, so they cannot be read. Use the desktop plugin's
+  OCR modes for those.
+- Highlighting cannot draw inside shadow DOM (open or closed), and in-place
+  highlighting is not available inside `input`/`textarea`; the text is still
+  read and shown in the HUD.
+- One active read at a time. A selection is capped at 100,000 characters with a
+  visible message; each chunk sent to the bridge stays well below the bridge's
+  20,000-character request limit.
+- The browser must be able to reach the bridge at the configured loopback URL;
+  a stopped bridge produces a clear error in the popup and HUD with a link to
+  the options page.
+
+### Privacy
+
+The bridge is loopback-only. Audio is synthesized by the plugin's configured
+provider and returned to the browser as a response body; the extension plays it
+from a Blob URL. The bridge logs method, path and status only — never selected
+text, request bodies or audio. It rejects non-extension browser origins and
+answers Chrome's Private Network Access preflight, so a random web page cannot
+use the token-bearing endpoint. The token protects the endpoint from other
+local processes and from extension origins you have not approved.
+
+This changes where the audio is played, not where text is processed. Local
+providers still run on this machine. If you have selected a cloud provider,
+the selected text is sent to that provider by `bin/speak`, exactly as it is for
+desktop reads; the bridge adds no new remote destination.
+
+### Audio-output mode
+
+The bridge is built on the playback helpers' audio-output mode rather than a
+second synthesis path. When `TTS_AUDIO_OUT` is set, `lib/play.sh` writes the
+engine's audio to that path instead of playing it, and `TTS_AUDIO_META`
+receives a small JSON sidecar describing the format (`pcm-s16le` with rate and
+channels, or `file`). This is an additional sink: provider behaviour, cache
+semantics, exit status and the `TTS_SILENT` verification path are unchanged,
+and nothing changes when the variables are unset.
+
 ## Providers
 
 Bundled, all optional except piper:
+
+
 
 | Provider | Kind | Notes |
 |----------|------|-------|
@@ -345,7 +458,14 @@ update or unset it; saving another key cannot silently pretend to override it.
 ## Remove
 
 Before removing the plugin, use **Keys → Remove shortcuts** so no shortcuts
-are left behind, and remove cloud keys from the Provider tab if desired. Then:
+are left behind, and remove cloud keys from the Provider tab if desired. If you
+installed the browser bridge as a systemd user service, disable it first:
+
+```bash
+systemctl --user disable --now omarchy-tts-bridge.service
+```
+
+Then remove the plugin:
 
 ```bash
 omarchy plugin remove io.github.jhakeinson.tts
@@ -382,8 +502,10 @@ cat something.md | python3 ~/.config/omarchy/plugins/io.github.jhakeinson.tts/li
 
 ```bash
 python3 -m unittest discover -s tests -v
-python3 -m py_compile bin/speak-bindings bin/speak-setup lib/sanitize.py tests/*.py
+python3 -m py_compile bin/speak-bridge bin/speak-bindings bin/speak-setup lib/sanitize.py tests/*.py
 shellcheck -x bin/speak bin/speak-voice providers/* ocr/* lib/*.sh
+node --check chrome-extension/background.js   # every chrome-extension/*.js
+jq -e . chrome-extension/manifest.json
 ```
 
 For hot reload during development, clone the repository and symlink that clone

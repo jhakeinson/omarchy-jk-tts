@@ -19,7 +19,7 @@ Panel {
   readonly property color dim: Commons.Color.muted
   readonly property string ff: bar ? bar.fontFamily : Style.font.family
   property int currentTab: 0
-  readonly property var tabNames: ["Provider", "Voice", "Text", "Screen", "Languages", "Keys"]
+  readonly property var tabNames: ["Provider", "Voice", "Text", "Screen", "Languages", "Keys", "Browser"]
   property bool browsing: false
   property string voiceFilter: ""
   property string previewSource: "Visit https://omarchy.org in ~2s and run `speak --help`."
@@ -52,6 +52,31 @@ Panel {
   readonly property bool needsSetup: controller.infoLoaded && controller.setupLoaded
                                      && !controller.setup.ready
                                      && !hasUsableProvider && !setupSkipped
+  // The toggle records the choice in the config; the service state is read
+  // separately from `speak-bridge --status`.
+  readonly property bool bridgeEnabled: controller.info.browser?.enabled === true
+  // localPath keeps the trailing slash of the resolved directory URL, which
+  // would paint the install path as "...tts//chrome-extension".
+  readonly property string extensionPath:
+    String(controller.localPath(Qt.resolvedUrl("."))).replace(/\/+$/, "") + "/chrome-extension"
+  // The install path is long and mid-elided, so it is click-to-copy; the
+  // notice is transient because a hidden panel must not keep stale UI text.
+  property string pathCopiedNotice: ""
+  Timer {
+    id: pathCopiedReset
+    interval: 2500; repeat: false
+    onTriggered: root.pathCopiedNotice = ""
+  }
+  function copyExtensionPath() {
+    controller.copyText(root.extensionPath)
+    root.pathCopiedNotice = "Folder path copied. Paste it into “Load unpacked”."
+    pathCopiedReset.restart()
+  }
+  function toggleBridge(value) {
+    controller.setBridgeEnabled(value)
+    if (value) controller.revealBridgeToken()
+    else controller.bridgeToken = ""
+  }
   // PanelKeyCatcher's all-or-nothing `blocked` switch cannot both preserve
   // native control keys and contain Tab inside this popup. Track any focused
   // descendant instead: the handler below always owns Tab, then yields every
@@ -359,19 +384,28 @@ Panel {
     if (opened) {
       restorePending = true
       controller.refresh(); controller.refreshBindings(); controller.refreshSetup(); controller.refreshDownload()
+      controller.refreshBridge()
+      // A re-summon keeps the previous currentTab, so no change signal will
+      // fire - and the close handler emptied the token, so a hidden Browser
+      // tab must be re-fed here. callLater lets restoreFromInfo settle first.
+      Qt.callLater(root.maybeRevealBridgeToken)
     } else {
       // Never retain a pasted credential in a hidden, persistent panel.
       apiProvider = ""; apiVendor = ""
       ocrApiProvider = ""; ocrApiVendor = ""
+      controller.bridgeToken = ""
     }
   }
 
   function restoreFromInfo() {
     if (!restorePending || !controller.infoLoaded) return
     restorePending = false
-    currentTab = Math.max(0, Math.min(5, Number(controller.info.ui?.lastTab || 0)))
+    currentTab = Math.max(0, Math.min(6, Number(controller.info.ui?.lastTab || 0)))
     sampleText = String(controller.info.ui?.sampleText || sampleText)
     controller.previewText(previewSource)
+    // Info just landed: if it says the bridge is on while we already sit on
+    // the Browser tab, the change signal for currentTab never fires.
+    root.maybeRevealBridgeToken()
   }
   Connections {
     target: controller
@@ -395,7 +429,17 @@ Panel {
       }
     }
   }
-  onCurrentTabChanged: if (opened) controller.setConfig(".ui.lastTab", currentTab)
+  // The token belongs to the Browser tab: it is fetched only while that tab
+  // is in use with the bridge on, so no other view ever requests a
+  // credential, and a hidden panel never holds one.
+  function maybeRevealBridgeToken() {
+    if (opened && currentTab === 6 && root.bridgeEnabled && controller.bridgeToken === "")
+      controller.revealBridgeToken()
+  }
+  onCurrentTabChanged: if (opened) {
+    controller.setConfig(".ui.lastTab", currentTab)
+    root.maybeRevealBridgeToken()
+  }
 
   KeyboardPanel {
     id: panelCard
@@ -435,9 +479,9 @@ Panel {
           if (chord) root.capturedChord = chord
           event.accepted = true; return
         }
-        if (event.key === Qt.Key_Left) root.currentTab = (root.currentTab + 5) % 6
-        else if (event.key === Qt.Key_Right) root.currentTab = (root.currentTab + 1) % 6
-        else if (event.key >= Qt.Key_1 && event.key <= Qt.Key_6) root.currentTab = event.key - Qt.Key_1
+        if (event.key === Qt.Key_Left) root.currentTab = (root.currentTab + 6) % 7
+        else if (event.key === Qt.Key_Right) root.currentTab = (root.currentTab + 1) % 7
+        else if (event.key >= Qt.Key_1 && event.key <= Qt.Key_7) root.currentTab = event.key - Qt.Key_1
         else return
         event.accepted = true
       }
@@ -1281,6 +1325,109 @@ Panel {
           }
           Text { width: parent.width; wrapMode: Text.WordWrap; text: "Only the marked omarchy-tts block in bindings.lua is managed. Every write is backed up and rolled back if Hyprland reports an error."; color: root.dim; font.family: root.ff; font.pixelSize: Style.font.caption }
           Text { width: parent.width; visible: root.realConflicts.length > 0; wrapMode: Text.WordWrap; text: "Choose different shortcuts for: " + root.realConflicts.join(", "); color: Commons.Color.urgent; font.family: root.ff; font.pixelSize: Style.font.caption }
+        }
+
+        // Browser -----------------------------------------------------------
+        Column {
+          width: parent.width; spacing: Style.space(10); visible: !root.needsSetup && root.currentTab === 6
+          Item {
+            width: parent.width; height: bridgeHeader.implicitHeight
+            PanelSectionHeader { id: bridgeHeader; text: "Browser bridge"; foreground: root.fg }
+            Text { anchors.right: parent.right; textFormat: Text.PlainText
+                   text: root.bridgeEnabled
+                         ? (controller.bridge.running ? "● Running" : "Not running")
+                         : "Disabled"
+                   color: root.bridgeEnabled && controller.bridge.running ? Commons.Color.accent : root.dim
+                   font.family: root.ff; font.pixelSize: Style.font.caption }
+          }
+          Text {
+            width: parent.width; wrapMode: Text.WordWrap
+            text: "Let the Chrome reader speak selections with this plugin's provider, voice and speed. The bridge is a small HTTP server on this computer only: it binds 127.0.0.1, answers only to its own pairing token, and is never reachable from the network."
+            color: root.dim; font.family: root.ff; font.pixelSize: Style.font.caption
+          }
+          SettingToggle {
+            label: "Enable the browser bridge"; foreground: root.fg
+            description: "Starts a user systemd service; disabling stops it and keeps it from starting at boot."
+            checked: root.bridgeEnabled
+            onToggled: function(value) { root.toggleBridge(value) }
+          }
+          Column {
+            width: parent.width; spacing: Style.space(10); visible: root.bridgeEnabled
+            Text {
+              width: parent.width; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+              text: controller.bridge.running
+                    ? "The bridge answers at " + (String(controller.bridge.url || "http://127.0.0.1:8787/v1/health").replace(/\/v1\/health$/, "")) + "."
+                    : "The service is enabled but not answering yet. It starts now with the desktop; if it stays down, check it with: systemctl --user status omarchy-tts-bridge.service"
+              color: root.dim; font.family: root.ff; font.pixelSize: Style.font.caption
+            }
+            Item {
+              width: parent.width; height: tokenHeader.implicitHeight
+              PanelSectionHeader { id: tokenHeader; text: "Pairing token"; foreground: root.fg }
+              InlineAction { anchors.right: parent.right
+                             text: "Copy token"
+                             color: Commons.Color.accent; font.family: root.ff; font.pixelSize: Style.font.caption
+                             enabled: controller.bridgeToken !== ""
+                             onTriggered: controller.copyBridgeToken() }
+            }
+            TextField {
+              id: tokenField
+              width: parent.width
+              text: controller.bridgeToken
+              placeholderText: "Loading the pairing token…"
+              readOnly: true; selectByMouse: true
+              foreground: root.fg; maximumLength: 128
+              font.family: root.ff; font.pixelSize: Style.font.caption
+            }
+            Column {
+              width: parent.width; spacing: 2
+              Text { width: parent.width; text: "Install the reader extension:"; color: root.fg; font.family: root.ff; font.pixelSize: Style.font.caption }
+              Text { width: parent.width; wrapMode: Text.WordWrap; text: "1. Open chrome://extensions and turn on Developer mode."; color: root.dim; font.family: root.ff; font.pixelSize: Style.font.caption }
+              Text { width: parent.width; wrapMode: Text.WordWrap; text: "2. Click “Load unpacked” and choose this folder (click the path to copy it):"; color: root.dim; font.family: root.ff; font.pixelSize: Style.font.caption }
+              Item {
+                id: pathRow
+                width: parent.width
+                height: pathText.implicitHeight
+                activeFocusOnTab: true
+                Accessible.role: Accessible.Button
+                Accessible.name: "Copy the extension folder path: " + root.extensionPath
+                Accessible.onPressAction: root.copyExtensionPath()
+                Keys.onSpacePressed: root.copyExtensionPath()
+                Keys.onReturnPressed: root.copyExtensionPath()
+                Keys.onEnterPressed: root.copyExtensionPath()
+                Text {
+                  id: pathText
+                  width: parent.width; elide: Text.ElideMiddle; textFormat: Text.PlainText
+                  text: root.extensionPath
+                  color: pathRow.activeFocus || pathMouse.containsMouse || root.pathCopiedNotice !== "" ? Commons.Color.accent : root.fg
+                  font.family: root.ff; font.pixelSize: Style.font.caption
+                }
+                MouseArea {
+                  id: pathMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.copyExtensionPath()
+                }
+              }
+              Text {
+                width: parent.width; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                visible: root.pathCopiedNotice !== ""
+                text: root.pathCopiedNotice
+                color: Commons.Color.accent; font.family: root.ff; font.pixelSize: Style.font.caption
+              }
+              Text { width: parent.width; wrapMode: Text.WordWrap
+                     text: "3. Open the reader's Options, paste the token above, leave the bridge URL at http://127.0.0.1:8787, and click “Test connection”."
+                     color: root.dim; font.family: root.ff; font.pixelSize: Style.font.caption }
+              Text { width: parent.width; wrapMode: Text.WordWrap
+                     text: "4. Select text on a page and press Alt+Shift+E, or right-click the selection and choose “Read selection aloud”."
+                     color: root.dim; font.family: root.ff; font.pixelSize: Style.font.caption }
+            }
+            Text {
+              width: parent.width; wrapMode: Text.WordWrap
+              text: "The token is stored mode 0600 at ~/.config/omarchy-tts/browser-token. Run bin/speak-bridge --rotate-token after pasting it anywhere you no longer trust."
+              color: root.dim; font.family: root.ff; font.pixelSize: Style.font.caption
+            }
+          }
         }
 
         Rectangle {

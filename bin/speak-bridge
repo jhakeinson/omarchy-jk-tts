@@ -1,0 +1,1012 @@
+#!/usr/bin/env python3
+"""Local HTTP bridge between the Chrome extension and the Omarchy TTS plugin.
+
+The bridge binds loopback only, requires a bearer token, and turns page text
+into audio by driving ``bin/speak`` with the plugin's audio-out sink.  It is
+Python 3.11 stdlib only on purpose: it ships with the plugin.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import hmac
+import json
+import os
+import secrets
+import shutil
+import signal
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+BRIDGE_VERSION = "0.1.0"
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8787
+
+PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+SPEAK = PLUGIN_ROOT / "bin" / "speak"
+PLUGIN_MANIFEST = PLUGIN_ROOT / "manifest.json"
+
+MAX_BODY = 256 * 1024
+MAX_TEXT = 20_000
+MAX_MESSAGE = 400
+SYNTH_TIMEOUT = 120
+INFO_TTL = 15.0
+PLUGIN_MAX_CHARS = 200_000
+PLUGIN_MAX_BYTES = 1_048_576
+
+# Serialize actual synthesis: one provider invocation at a time.
+_SYNTH_LOCK = threading.Lock()
+_INFO_LOCK = threading.Lock()
+INFO_CACHE: dict = {"at": 0.0, "value": None}
+
+
+class BridgeError(Exception):
+    """An error that maps directly onto a bounded HTTP error response."""
+
+    def __init__(self, status: int, code: str, message: str):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+
+
+class TokenError(Exception):
+    """The token file exists in an unsafe form or cannot be used."""
+
+
+# ---------------------------------------------------------------------------
+# Token handling
+# ---------------------------------------------------------------------------
+
+def default_token_path() -> Path:
+    config_home = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(config_home) / "omarchy-tts" / "browser-token"
+
+
+def _is_symlink(path: Path) -> bool:
+    try:
+        return path.is_symlink()
+    except OSError:
+        return False
+
+
+def _refuse_symlinks(path: Path) -> None:
+    """Refuse a token path (or its immediate parent) that is a symlink."""
+    if _is_symlink(path):
+        raise TokenError(f"refusing symlinked token file: {path}")
+    if _is_symlink(path.parent):
+        raise TokenError(f"refusing symlinked token directory: {path.parent}")
+
+
+def read_token(path: Path | str | None = None) -> str | None:
+    path = Path(path) if path is not None else default_token_path()
+    _refuse_symlinks(path)
+    # O_NOFOLLOW keeps the leaf safe even if it changes between checks.
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno in (getattr(os, "ELOOP", 40), getattr(os, "EMLINK", 31)):
+            raise TokenError(f"refusing symlinked token file: {path}") from exc
+        raise TokenError(f"cannot read token file: {path}") from exc
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise TokenError(f"token path is not a regular file: {path}")
+            if info.st_mode & 0o077:
+                try:
+                    os.fchmod(handle.fileno(), 0o600)
+                except OSError as exc:
+                    raise TokenError(f"cannot secure token file: {path}") from exc
+            raw = handle.read(4096)
+    except OSError as exc:
+        raise TokenError(f"cannot read token file: {path}") from exc
+    try:
+        token = raw.decode("ascii", "strict").strip()
+    except UnicodeDecodeError:
+        raise TokenError(f"token file is not ASCII: {path}")
+    return token or None
+
+
+def write_token(token: str, path: Path | str | None = None) -> Path:
+    path = Path(path) if path is not None else default_token_path()
+    _refuse_symlinks(path)
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(path.parent, 0o700)
+    except OSError as exc:
+        raise TokenError(f"cannot create token directory: {path.parent}") from exc
+    _refuse_symlinks(path)
+
+    fd = -1
+    temp_name = ""
+    try:
+        fd, temp_name = tempfile.mkstemp(prefix=".browser-token.", dir=str(path.parent))
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            fd = -1
+            handle.write(token.encode("ascii") + b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if _is_symlink(path):
+            raise TokenError(f"refusing symlinked token file: {path}")
+        os.replace(temp_name, path)
+        temp_name = ""
+        os.chmod(path, 0o600)
+    except TokenError:
+        raise
+    except OSError as exc:
+        raise TokenError(f"cannot write token file: {path}") from exc
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if temp_name:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+    return path
+
+
+def ensure_token(path: Path | str | None = None) -> str:
+    token = read_token(path)
+    if token:
+        return token
+    token = secrets.token_urlsafe(32)
+    write_token(token, path)
+    return token
+
+
+def rotate_token(path: Path | str | None = None) -> str:
+    token = secrets.token_urlsafe(32)
+    write_token(token, path)
+    return token
+
+
+# ---------------------------------------------------------------------------
+# Plugin metadata and speak --info
+# ---------------------------------------------------------------------------
+
+def plugin_version() -> str:
+    try:
+        with open(PLUGIN_MANIFEST, "r", encoding="utf-8") as handle:
+            value = json.load(handle).get("version")
+        return str(value) if value else "unknown"
+    except (OSError, ValueError, AttributeError):
+        return "unknown"
+
+
+def _as_int(value, default: int = 0) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return number if number >= 0 else default
+
+
+def _active_provider(info: dict) -> dict:
+    name = info.get("provider")
+    providers = info.get("providers")
+    if isinstance(providers, list):
+        for entry in providers:
+            if isinstance(entry, dict) and entry.get("name") == name:
+                return entry
+    return {}
+
+
+def trim_info(raw: dict) -> dict:
+    provider = raw.get("provider")
+    provider = provider if isinstance(provider, str) and provider else "piper"
+    voice = raw.get("voice")
+    voice = voice if isinstance(voice, str) else ""
+    try:
+        rate = float(raw.get("rate"))
+    except (TypeError, ValueError):
+        rate = 1.0
+    max_chars = _as_int(raw.get("maxChars"), 0)
+
+    active = _active_provider(raw)
+    limit_chars = _as_int(active.get("maxChars"), 0) or PLUGIN_MAX_CHARS
+    limit_bytes = _as_int(active.get("maxBytes"), 0) or PLUGIN_MAX_BYTES
+
+    return {
+        "provider": provider,
+        "voice": voice,
+        "rate": rate,
+        "maxChars": max_chars,
+        "limits": {"maxChars": limit_chars, "maxBytes": limit_bytes},
+        "bridgeVersion": BRIDGE_VERSION,
+    }
+
+
+def reset_info_cache() -> None:
+    with _INFO_LOCK:
+        INFO_CACHE["at"] = 0.0
+        INFO_CACHE["value"] = None
+
+
+def _terminate_process_group(proc: subprocess.Popen, command: list[str]) -> subprocess.CompletedProcess:
+    """Kill a timed-out child's process group, then collect its output."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except OSError:
+        pass
+    try:
+        out, err = proc.communicate(timeout=5)
+        return subprocess.CompletedProcess(command, proc.returncode, out, err)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        out, err = proc.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        out, err = b"", b""
+    return subprocess.CompletedProcess(command, proc.returncode, out, err)
+
+
+def _run_speak(args: list[str], timeout: int,
+               input_bytes: bytes | None = None,
+               env: dict | None = None) -> subprocess.CompletedProcess:
+    """Run the speak CLI in its own process group so timeouts kill the engine too."""
+    command = [str(SPEAK)] + args
+    proc = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(input_bytes, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        result = _terminate_process_group(proc, command)
+        raise subprocess.TimeoutExpired(
+            command, timeout, output=result.stdout, stderr=result.stderr
+        )
+    return subprocess.CompletedProcess(command, proc.returncode, out, err)
+
+
+def _stop_speak_provider() -> None:
+    """Ask the plugin to stop a provider that escaped our process group.
+
+    ``bin/speak`` starts providers under ``setsid --fork``, so on a bridge
+    timeout the provider owns a different session and survives a killpg of the
+    CLI.  ``speak --stop`` reads the plugin's own PID file and terminates that
+    group; it is the only reliable way to collect the engine.
+    """
+    try:
+        _run_speak(["--stop"], timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _run_speak_info() -> dict:
+    try:
+        result = _run_speak(["--info"], timeout=20)
+    except FileNotFoundError as exc:
+        raise BridgeError(502, "synthesis_failed", "speak CLI not found") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise BridgeError(504, "timeout", "speak --info timed out") from exc
+    if result.returncode != 0:
+        detail = _bounded_stderr(result.stderr, result.stdout)
+        raise BridgeError(502, "synthesis_failed", detail or "speak --info failed")
+    try:
+        raw = json.loads(result.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise BridgeError(502, "synthesis_failed", "speak --info returned invalid JSON") from exc
+    if not isinstance(raw, dict):
+        raise BridgeError(502, "synthesis_failed", "speak --info returned invalid data")
+    return raw
+
+
+def get_info(refresh: bool = False) -> dict:
+    now = time.monotonic()
+    with _INFO_LOCK:
+        cached = INFO_CACHE["value"]
+        if not refresh and cached is not None and now - INFO_CACHE["at"] < INFO_TTL:
+            return copy.deepcopy(cached)
+    raw = _run_speak_info()
+    trimmed = trim_info(raw)
+    with _INFO_LOCK:
+        INFO_CACHE["at"] = time.monotonic()
+        INFO_CACHE["value"] = trimmed
+    return copy.deepcopy(trimmed)
+
+
+# ---------------------------------------------------------------------------
+# Audio helpers (kept as module functions so tests can call them directly)
+# ---------------------------------------------------------------------------
+
+def wav_header(rate: int, channels: int, data_size: int) -> bytes:
+    block_align = channels * 2
+    byte_rate = rate * block_align
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF", 36 + data_size, b"WAVE",
+        b"fmt ", 16, 1, channels, rate, byte_rate, block_align, 16,
+        b"data", data_size,
+    )
+
+
+def pcm_to_wav(pcm: bytes, rate: int, channels: int) -> bytes:
+    block_align = channels * 2
+    aligned = len(pcm) - (len(pcm) % block_align)
+    return wav_header(rate, channels, aligned) + pcm[:aligned]
+
+
+def sniff_audio(data: bytes) -> tuple[str, str]:
+    """Return (format, content-type) or raise for unsupported audio."""
+    if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        return "wav", "audio/wav"
+    if data[:3] == b"ID3":
+        return "mp3", "audio/mpeg"
+    if len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0:
+        return "mp3", "audio/mpeg"
+    if data[:4] == b"OggS":
+        return "ogg", "audio/ogg"
+    if data[:4] == b"fLaC":
+        # The response contract only allows wav/mpeg/ogg content types, so a
+        # FLAC stream is detected but reported as unsupported.
+        raise BridgeError(502, "unsupported_audio", "unsupported audio format: flac")
+    raise BridgeError(502, "unsupported_audio", "unsupported audio format")
+
+
+def describe_audio(audio: bytes, meta: dict | None) -> tuple[bytes, str, str]:
+    """Turn captured bytes plus sidecar metadata into (body, format, mime)."""
+    if isinstance(meta, dict) and meta.get("format") == "pcm-s16le":
+        rate = _as_int(meta.get("rate"), 0)
+        channels = _as_int(meta.get("channels"), 0)
+        if not (8000 <= rate <= 384000) or not (1 <= channels <= 8):
+            raise BridgeError(502, "unsupported_audio", "invalid PCM metadata")
+        return pcm_to_wav(audio, rate, channels), "wav", "audio/wav"
+    fmt, mime = sniff_audio(audio)
+    return audio, fmt, mime
+
+
+def _bounded_stderr(stderr: bytes | None, stdout: bytes | None = None) -> str:
+    tail = (stderr or b"")[-800:]
+    if not tail.strip() and stdout:
+        tail = stdout[-800:]
+    message = tail.decode("utf-8", "replace")
+    return " ".join(message.split())[:MAX_MESSAGE]
+
+
+def _redact(message: str, text: str) -> str:
+    if text:
+        message = message.replace(text, "[text]")
+    return " ".join(message.split())[:MAX_MESSAGE]
+
+
+# ---------------------------------------------------------------------------
+# HTTP server
+# ---------------------------------------------------------------------------
+
+class BridgeServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, server_address, handler=None, token_path=None):
+        self.token_path = Path(token_path) if token_path else default_token_path()
+        super().__init__(server_address, handler or BridgeHandler)
+
+
+def build_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
+                 token_path=None) -> BridgeServer:
+    return BridgeServer((host, port), token_path=token_path)
+
+
+class BridgeHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "speak-bridge/" + BRIDGE_VERSION
+    timeout = 30
+
+    # -- plumbing -----------------------------------------------------------
+
+    def log_message(self, format, *args):  # noqa: A002 - stdlib signature
+        # Only method/path/status, never request text or audio.
+        path = getattr(self, "path", "").split("?", 1)[0]
+        sys.stderr.write(
+            "speak-bridge: %s %s %s\n"
+            % (getattr(self, "command", "?"), path, self.last_status())
+        )
+
+    def last_status(self):
+        return getattr(self, "_status_for_log", "-")
+
+    def _origin(self):
+        return self.headers.get("Origin")
+
+    @staticmethod
+    def _origin_allowed(origin: str | None) -> bool:
+        if origin is None:
+            return True
+        if any(ch in origin for ch in "\r\n"):
+            return False
+        return origin.startswith("chrome-extension://")
+
+    def _cors(self, origin: str | None, preflight: bool = False) -> dict:
+        headers = {"Vary": "Origin"}
+        if origin is not None:
+            headers["Access-Control-Allow-Origin"] = origin
+            headers["Access-Control-Allow-Headers"] = "authorization, content-type"
+            headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        if preflight:
+            headers["Access-Control-Allow-Private-Network"] = "true"
+        return headers
+
+    def _send(self, status: int, body: bytes = b"", content_type: str | None = None,
+              headers: dict | None = None) -> None:
+        self._status_for_log = status
+        self.send_response(status)
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        if content_type:
+            self.send_header("Content-Type", content_type)
+        if self.close_connection:
+            self.send_header("Connection", "close")
+        if status != 204:
+            self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body and status != 204:
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    def _send_json(self, status: int, payload: dict, origin: str | None = None) -> None:
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self._send(status, body, "application/json; charset=utf-8",
+                   self._cors(origin))
+
+    def _read_body(self) -> bytes:
+        transfer = self.headers.get("Transfer-Encoding")
+        if transfer and transfer.lower() != "identity":
+            self.close_connection = True
+            raise BridgeError(400, "bad_request", "chunked request bodies are not supported")
+        raw_length = self.headers.get("Content-Length")
+        if raw_length is None:
+            raise BridgeError(400, "bad_request", "missing Content-Length")
+        try:
+            length = int(raw_length)
+        except ValueError:
+            self.close_connection = True
+            raise BridgeError(400, "bad_request", "invalid Content-Length")
+        if length < 0:
+            self.close_connection = True
+            raise BridgeError(400, "bad_request", "invalid Content-Length")
+        if length > MAX_BODY:
+            # Do not drain an attacker-controlled body: close the connection so
+            # the next request cannot be parsed out of leftover bytes.
+            self.close_connection = True
+            raise BridgeError(413, "too_large", "request body is too large")
+        data = self.rfile.read(length)
+        if len(data) != length:
+            self.close_connection = True
+            raise BridgeError(400, "bad_request", "incomplete request body")
+        return data
+
+    def _discard_body(self) -> None:
+        """Consume an optional body so a keep-alive connection stays aligned."""
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            return
+        raw_length = self.headers.get("Content-Length")
+        if raw_length is None:
+            return
+        try:
+            length = int(raw_length)
+        except ValueError:
+            self.close_connection = True
+            return
+        if length <= 0:
+            if length < 0:
+                self.close_connection = True
+            return
+        if length > MAX_BODY:
+            self.close_connection = True
+            return
+        remaining = length
+        while remaining > 0:
+            chunk = self.rfile.read(min(65536, remaining))
+            if not chunk:
+                self.close_connection = True
+                return
+            remaining -= len(chunk)
+
+    def _authorized(self) -> bool:
+        header = self.headers.get("Authorization", "")
+        try:
+            token = read_token(self.server.token_path)
+        except TokenError:
+            return False
+        if not token:
+            return False
+        scheme, _, presented = header.partition(" ")
+        if scheme.lower() != "bearer":
+            return False
+        try:
+            return hmac.compare_digest(presented.strip().encode("ascii"),
+                                       token.encode("ascii"))
+        except UnicodeEncodeError:
+            return False
+
+    def _route(self, method: str) -> None:
+        origin = self._origin()
+        path = self.path.split("?", 1)[0]
+
+        if not self._origin_allowed(origin):
+            self._discard_body()
+            self._send_json(403, {"error": "forbidden", "message": "origin not allowed"})
+            return
+
+        if not path.startswith("/v1/"):
+            self._discard_body()
+            self._send_json(404, {"error": "not_found", "message": "not found"}, origin)
+            return
+
+        if method == "OPTIONS":
+            self._discard_body()
+            self._send(204, b"", None, self._cors(origin, preflight=True))
+            return
+
+        if not self._authorized():
+            self._discard_body()
+            self._send_json(401, {"error": "unauthorized", "message": "missing or invalid token"},
+                            origin)
+            return
+
+        if path == "/v1/health":
+            if method != "GET":
+                self._method_not_allowed(origin)
+                return
+            self._handle_health(origin)
+        elif path == "/v1/info":
+            if method != "GET":
+                self._method_not_allowed(origin)
+                return
+            self._handle_info(origin)
+        elif path == "/v1/synthesize":
+            if method != "POST":
+                self._method_not_allowed(origin)
+                return
+            self._handle_synthesize(origin)
+        elif path == "/v1/stop":
+            if method != "POST":
+                self._method_not_allowed(origin)
+                return
+            self._handle_stop(origin)
+        else:
+            self._discard_body()
+            self._send_json(404, {"error": "not_found", "message": "not found"}, origin)
+
+    def _method_not_allowed(self, origin: str | None) -> None:
+        self._discard_body()
+        headers = self._cors(origin)
+        headers["Allow"] = "GET, POST, OPTIONS"
+        self._send(405, b"", None, headers)
+        self._status_for_log = 405
+
+    # -- endpoints ----------------------------------------------------------
+
+    def _handle_health(self, origin: str | None) -> None:
+        self._discard_body()
+        self._send_json(200, {
+            "ok": True,
+            "bridgeVersion": BRIDGE_VERSION,
+            "pluginVersion": plugin_version(),
+            "speaking": False,
+        }, origin)
+
+    def _handle_info(self, origin: str | None) -> None:
+        self._discard_body()
+        try:
+            info = get_info()
+        except BridgeError as exc:
+            self._send_json(exc.status, {"error": exc.code, "message": exc.message}, origin)
+            return
+        self._send_json(200, info, origin)
+
+    def _handle_stop(self, origin: str | None) -> None:
+        # Drain a bounded body so keep-alive connections stay aligned; stop
+        # itself takes no parameters.
+        try:
+            self._read_body()
+        except BridgeError:
+            self.close_connection = True
+        # Stop must not wait behind a running synthesis: cancelling it is the
+        # whole point, and `speak --stop` is safe to run concurrently.
+        try:
+            result = _run_speak(["--stop"], timeout=20)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            message = "speak --stop failed" if isinstance(exc, OSError) else "speak --stop timed out"
+            self._send_json(502, {"error": "synthesis_failed", "message": message}, origin)
+            return
+        if result.returncode != 0:
+            self._send_json(502, {
+                "error": "synthesis_failed",
+                "message": _bounded_stderr(result.stderr, result.stdout) or "speak --stop failed",
+            }, origin)
+            return
+        self._send_json(200, {"ok": True}, origin)
+
+    def _handle_synthesize(self, origin: str | None) -> None:
+        try:
+            raw = self._read_body()
+        except BridgeError as exc:
+            self._send_json(exc.status, {"error": exc.code, "message": exc.message}, origin)
+            return
+
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            self._send_json(400, {"error": "bad_request", "message": "invalid JSON body"}, origin)
+            return
+        if not isinstance(payload, dict):
+            self._send_json(400, {"error": "bad_request", "message": "expected a JSON object"}, origin)
+            return
+        text = payload.get("text")
+        if not isinstance(text, str):
+            self._send_json(400, {"error": "bad_request", "message": "text must be a string"}, origin)
+            return
+        if "\x00" in text:
+            self._send_json(400, {"error": "bad_request", "message": "text must not contain NUL"}, origin)
+            return
+        try:
+            text.encode("utf-8")
+        except UnicodeEncodeError:
+            self._send_json(400, {"error": "bad_request", "message": "text is not valid Unicode"}, origin)
+            return
+        if len(text) > MAX_TEXT:
+            self._send_json(413, {
+                "error": "too_large",
+                "message": "text exceeds %d characters" % MAX_TEXT,
+            }, origin)
+            return
+        if not text.strip():
+            self._send(body=b"", status=204, headers=self._cors(origin))
+            return
+
+        try:
+            meta = get_info()
+        except BridgeError:
+            meta = {"provider": "", "voice": "", "rate": 1.0}
+
+        audio = self._synthesize(text)
+
+        if audio is None:
+            self._send(204, b"", None, self._cors(origin))
+            return
+
+        body, fmt, mime = audio
+        headers = self._cors(origin)
+        headers.update({
+            "X-Tts-Provider": str(meta.get("provider", "")),
+            "X-Tts-Voice": str(meta.get("voice", "")),
+            "X-Tts-Rate": str(meta.get("rate", 1.0)),
+            "X-Tts-Format": fmt,
+            "Cache-Control": "no-store",
+        })
+        self._send(200, body, mime, headers)
+
+    def _synthesize(self, text: str):
+        """Run speak and return (body, format), or None when nothing was said."""
+        temp_dir = tempfile.mkdtemp(prefix="omarchy-tts-bridge-")
+        audio_path = Path(temp_dir) / "audio"
+        meta_path = Path(temp_dir) / "meta.json"
+        try:
+            env = os.environ.copy()
+            env["TTS_AUDIO_OUT"] = str(audio_path)
+            env["TTS_AUDIO_META"] = str(meta_path)
+            # The bridge is a real consumer: never run the silent verifier path.
+            env.pop("TTS_SILENT", None)
+
+            with _SYNTH_LOCK:
+                try:
+                    result = _run_speak(
+                        [],
+                        timeout=SYNTH_TIMEOUT,
+                        input_bytes=text.encode("utf-8"),
+                        env=env,
+                    )
+                except FileNotFoundError:
+                    raise BridgeError(502, "synthesis_failed", "speak CLI not found")
+                except subprocess.TimeoutExpired:
+                    # The provider may have left our process group via setsid;
+                    # let the plugin's own registry stop it as well.
+                    _stop_speak_provider()
+                    raise BridgeError(504, "timeout", "speech synthesis timed out")
+
+            if result.returncode != 0:
+                message = _redact(
+                    _bounded_stderr(result.stderr, result.stdout) or "speech synthesis failed",
+                    text,
+                )
+                raise BridgeError(502, "synthesis_failed", message)
+
+            try:
+                size = audio_path.stat().st_size
+            except OSError:
+                size = 0
+            if size > PLUGIN_MAX_BYTES:
+                # Bound memory and response size before reading provider output.
+                raise BridgeError(
+                    502,
+                    "audio_too_large",
+                    "synthesized audio exceeds the bridge size limit",
+                )
+            try:
+                audio = audio_path.read_bytes()
+            except OSError:
+                audio = b""
+            if not audio:
+                return None
+
+            meta = None
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                meta = None
+            body, fmt, mime = describe_audio(audio, meta)
+            return body, fmt, mime
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    # -- method dispatch ----------------------------------------------------
+
+    def _safe(self, method: str) -> None:
+        try:
+            self._route(method)
+        except BridgeError as exc:
+            try:
+                origin = self._origin()
+                if not self._origin_allowed(origin):
+                    origin = None
+                self._send_json(exc.status, {"error": exc.code, "message": exc.message}, origin)
+            except Exception:
+                pass
+        except Exception:
+            try:
+                self._send_json(500, {"error": "internal_error", "message": "internal error"})
+            except Exception:
+                pass
+
+    def do_GET(self):  # noqa: N802 - stdlib naming
+        self._safe("GET")
+
+    def do_POST(self):  # noqa: N802
+        self._safe("POST")
+
+    def do_OPTIONS(self):  # noqa: N802
+        self._safe("OPTIONS")
+
+    def do_HEAD(self):  # noqa: N802
+        self._safe("HEAD")
+
+    def do_PUT(self):  # noqa: N802
+        self._safe("PUT")
+
+    def do_DELETE(self):  # noqa: N802
+        self._safe("DELETE")
+
+    def do_PATCH(self):  # noqa: N802
+        self._safe("PATCH")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _systemd_quote(value: str) -> str:
+    # systemd expands % specifiers in unit files; doubling keeps literal paths.
+    escaped = value.replace("%", "%%")
+    return '"' + escaped.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def service_unit_path() -> Path:
+    service_dir = Path(os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")) / "systemd" / "user"
+    return service_dir / "omarchy-tts-bridge.service"
+
+
+def write_service_unit(host: str, port: int) -> Path:
+    """Write the user service unit, creating its directory. Returns the path."""
+    service_path = service_unit_path()
+    try:
+        service_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise BridgeError(1, "install_failed", f"cannot create {service_path.parent}: {exc}")
+    unit = (
+        "[Unit]\n"
+        "Description=Omarchy TTS browser bridge\n"
+        "After=network.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"ExecStart={_systemd_quote(sys.executable)} {_systemd_quote(str(Path(__file__).resolve()))}"
+        f" --host {host} --port {port}\n"
+        "Restart=on-failure\n"
+        "RestartSec=2\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(service_path, flags, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(unit)
+        os.chmod(service_path, 0o644)
+    except OSError as exc:
+        raise BridgeError(1, "install_failed", f"cannot write {service_path}: {exc}")
+    return service_path
+
+
+def _systemctl(*args: str) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(["systemctl", "--user", *args], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise BridgeError(1, "systemctl_failed", f"systemctl --user {' '.join(args)} failed: {exc}")
+
+
+def enable_service(host: str, port: int) -> dict:
+    """Install (or refresh) the unit and start it with systemd. Returns a payload."""
+    ensure_token()
+    write_service_unit(host, port)
+    _systemctl("daemon-reload")
+    _systemctl("enable", "--now", "omarchy-tts-bridge.service")
+    url = f"http://{host}:{port}"
+    print(json.dumps({"ok": True, "url": url}, separators=(",", ":")))
+    return {"ok": True, "url": url}
+
+
+def disable_service() -> dict:
+    """Stop the bridge and keep it from starting at boot. Idempotent."""
+    unit = "omarchy-tts-bridge.service"
+    stop = _systemctl("stop", unit)
+    if stop.returncode != 0 and "not loaded" not in stop.stderr.decode("utf-8", "replace").lower():
+        raise BridgeError(1, "systemctl_failed",
+                          f"systemctl --user stop failed: {stop.stderr.decode('utf-8', 'replace').strip()}")
+    disable = _systemctl("disable", unit)
+    message = disable.stderr.decode("utf-8", "replace").lower()
+    if disable.returncode != 0 and not ("not found" in message or "does not exist" in message
+                                        or "no unit file" in message or "not loaded" in message):
+        raise BridgeError(1, "systemctl_failed",
+                          f"systemctl --user disable failed: {disable.stderr.decode('utf-8', 'replace').strip()}")
+    print(json.dumps({"ok": True}, separators=(",", ":")))
+    return {"ok": True}
+
+
+def install_service(host: str, port: int) -> int:
+    token = ensure_token()
+    try:
+        enable_service(host, port)
+    except BridgeError as exc:
+        print(f"speak-bridge: {exc.message}", file=sys.stderr)
+        return 1
+
+    print(f"Installed {service_unit_path()}")
+    print(f"Bridge token: {token}")
+    print("Paste this token into the extension options, then click Test connection.")
+    return 0
+
+
+def service_enabled() -> bool:
+    """True when systemd has the bridge unit enabled at boot."""
+    try:
+        result = _systemctl("is-enabled", "omarchy-tts-bridge.service")
+    except BridgeError:
+        return False
+    return result.returncode == 0
+
+
+def report_status(host: str, port: int) -> int:
+    url = f"http://{host}:{port}/v1/health"
+    token = read_token()
+    enabled = service_enabled()
+    if not token:
+        print(json.dumps({"running": False, "enabled": enabled, "url": url,
+                          "reason": "token missing"}))
+        return 1
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(request, timeout=3) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        print(json.dumps({"running": True, "enabled": enabled, "url": url,
+                          "health": payload}, separators=(",", ":")))
+        return 0
+    except (urllib.error.URLError, OSError, ValueError):
+        print(json.dumps({"running": False, "enabled": enabled, "url": url}))
+        return 1
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="speak-bridge",
+        description="Loopback HTTP bridge between the Chrome extension and Omarchy TTS.",
+    )
+    parser.add_argument("--host", default=DEFAULT_HOST, choices=[DEFAULT_HOST])
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--version", action="version",
+                        version=f"speak-bridge {BRIDGE_VERSION}")
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--print-token", action="store_true")
+    actions.add_argument("--rotate-token", action="store_true")
+    actions.add_argument("--status", action="store_true")
+    actions.add_argument("--enable", action="store_true",
+                         help="install and start the bridge as a user systemd service")
+    actions.add_argument("--disable", action="store_true",
+                         help="stop the bridge and disable its systemd service")
+    actions.add_argument("--install-service", action="store_true")
+    return parser.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    try:
+        return _run(args)
+    except TokenError as exc:
+        print(f"speak-bridge: {exc}", file=sys.stderr)
+        return 1
+
+
+def _run(args) -> int:
+    if args.print_token:
+        print(ensure_token())
+        return 0
+    if args.rotate_token:
+        print(rotate_token())
+        return 0
+    if args.status:
+        return report_status(args.host, args.port)
+    try:
+        if args.enable:
+            enable_service(args.host, args.port)
+            return 0
+        if args.disable:
+            disable_service()
+            return 0
+    except BridgeError as exc:
+        print(f"speak-bridge: {exc.message}", file=sys.stderr)
+        return 1
+    if args.install_service:
+        return install_service(args.host, args.port)
+
+    ensure_token()
+
+    server = build_server(args.host, args.port)
+    print(f"speak-bridge {BRIDGE_VERSION} listening on http://{args.host}:{args.port}",
+          file=sys.stderr)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

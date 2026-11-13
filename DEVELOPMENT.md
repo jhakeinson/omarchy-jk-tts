@@ -1,7 +1,7 @@
 # Architecture and review guide
 
-The plugin has a six-tab settings panel: Provider, Voice, Text, Screen,
-Languages, and Keys. Its command-line boundary remains independently useful
+The plugin has a seven-tab settings panel: Provider, Voice, Text, Screen,
+Languages, Keys, and Browser. Its command-line boundary remains independently useful
 and testable.
 
 ## Ownership boundaries
@@ -11,6 +11,20 @@ and testable.
 - `lib/health.sh` owns shared, atomic health-cache invalidation.
 - `lib/cache.sh` owns the synthesis result cache: keying, staged commits,
   LRU/TTL eviction and refusal of unsafe cache locations.
+- `lib/play.sh` owns the playback helpers. Its optional audio-output mode
+  (`TTS_AUDIO_OUT`/`TTS_AUDIO_META`) writes engine audio and a format sidecar
+  instead of playing it; it is an additional sink and must not change provider
+  behaviour, cache semantics, pipeline exit status or the `TTS_SILENT`
+  verification path.
+- `bin/speak-bridge` owns the loopback HTTP bridge for the browser extension:
+  token lifecycle, origin checks, request bounds, one-at-a-time synthesis
+  through `bin/speak`, and audio container framing, plus the lifecycle of its
+  systemd user service (`--enable`/`--disable`). It never implements a
+  provider or resolves `speak` from `PATH`.
+- `chrome-extension/` owns the Manifest V3 reader: page-selection capture,
+  chunking and DOM offset mapping, the Shadow DOM HUD, highlighting and
+  playback. HTTP to the bridge happens only in the service worker; content
+  scripts exchange messages with it.
 - `lib/sanitize.py` is the one sanitizer used for speech and live preview.
 - `bin/speak-daemon` owns resident synthesis for the heavy local engines:
   request validation, peer credentials, per-request engine fingerprint
@@ -106,6 +120,82 @@ disables it; `speak --verify` sets it and `TTS_DAEMON=0` together so health
 checks always exercise real synthesis. Cloud providers are never cached:
 their output can change server-side under the same voice id.
 
+### Browser bridge and extension
+
+`bin/speak-bridge` is a standalone Python 3.11+ standard-library HTTP server
+bound to `127.0.0.1` (default port 8787). It derives the plugin root from
+`Path(__file__).resolve().parents[1]` and runs `<root>/bin/speak` directly; it
+never resolves `speak` from `PATH`. The bridge is a transport and framing layer
+only: provider selection, sanitization, cache and playback policy stay in the
+CLI.
+
+**Token and origin model.** The bearer token is 32 bytes from
+`secrets.token_urlsafe` in
+`${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-tts/browser-token`, created with
+parent directories mode 0700 and the file mode 0600. Reads and writes refuse
+symlinks and replace the file atomically. Every `/v1/*` request compares the
+token with `hmac.compare_digest`. Requests may omit `Origin` (CLI/tests) or
+send one starting with `chrome-extension://`; other origins get 403. Allowed
+origins are echoed in `Access-Control-Allow-Origin` with `Vary: Origin` and the
+authorization/content-type/method headers; `OPTIONS` additionally returns
+`Access-Control-Allow-Private-Network: true`. A known path with the wrong method
+gets 405; a method with no handler (for example TRACE) gets the stdlib's 501.
+The server has no static file or directory-listing path. Requests that are
+rejected before their body is read drain a bounded body (or close the
+connection) so HTTP/1.1 keep-alive streams stay aligned.
+
+**Protocol.** JSON request bodies are capped at 256 KiB and text at 20,000
+characters.
+
+| Endpoint | Result |
+|---|---|
+| `GET /v1/health` | `{ok, bridgeVersion, pluginVersion, speaking}`; plugin version comes from `manifest.json`. |
+| `GET /v1/info` | Provider, voice, rate, `maxChars` and the active provider's char/byte limits from `speak --info`, cached for about 15 seconds, trimmed to those fields. |
+| `POST /v1/synthesize` | `{"text": ...}` only; returns audio with `X-Tts-Provider/Voice/Rate/Format` and `Cache-Control: no-store`, 204 when nothing is speakable, or a bounded JSON error. |
+| `POST /v1/stop` | Runs `speak --stop`, then `{ok: true}`. |
+
+Synthesis runs in a private `mkdtemp` cleaned up in `finally`, under a global
+lock so only one engine request is active. The child environment copies the
+caller's (`TTS_CACHE` and configuration included), sets `TTS_AUDIO_OUT` and
+`TTS_AUDIO_META`, and explicitly unsets `TTS_SILENT`. `speak` gets the text on
+stdin with a 120-second timeout. The child runs in its own process group; because
+`bin/speak` starts the engine under `setsid --fork`, a timeout also runs
+`speak --stop` so the plugin's own PID registry terminates that escaped provider
+group. A `pcm-s16le` sidecar is
+wrapped in a RIFF/WAVE PCM-16 header using its rate/channels and truncated to
+block alignment. File output is sniffed as WAV, MP3 or Ogg; FLAC is detected but
+rejected as `unsupported_audio`, as is any unknown container. Exit 0 with no
+audio is 204; nonzero is
+`synthesis_failed` with at most ~800 bytes of collapsed stderr; timeout is 504.
+No success or error body ever includes the selected text or audio. Logs contain
+method, path and status only.
+
+**Extension.** `chrome-extension/` is a classic-script MV3 extension (Chrome
+105+) and stores `bridgeUrl`/`bridgeToken` in `chrome.storage.local` and the
+active read descriptor in `chrome.storage.session`. All bridge HTTP calls run
+in the service worker (5 s for info/health, 130 s for synthesize), which avoids
+content-script CORS and CSP. The content script captures the selection Range,
+builds canonical text plus DOM offsets, splits with `Intl.Segmenter` (regex
+fallback) into ≤400-character chunks, and plays returned audio from Blob URLs.
+It highlights the selection and current chunk with the CSS Custom Highlight API,
+prefetches the next chunk, and reports `READ_STATE` at least 4 times per second
+while playing. The top frame (not an iframe reader) renders the HUD in a closed
+Shadow DOM, and receives `HUD_STATE`; HUD controls travel back as
+`HUD_CONTROL`. Context-menu reads use the clicked `frameId`; shortcut and popup
+reads probe frames for a non-collapsed selection and prefer the focused
+document. The extension enforces one active read, a 100,000-character total
+selection cap, and clears the `▶` badge on done/stop/navigation/tab close.
+
+`tests/test_bridge.py` loads the bridge with `SourceFileLoader` and stubs the
+CLI through module globals. It covers token permissions and symlink refusal,
+401/403/preflight behavior, HTTP/1.1 keep-alive alignment after early
+rejections, 400/413 bounds (including lone surrogates and oversized bodies),
+PCM-to-WAV framing, MP3 passthrough, 204 and 502 paths (asserting the selected
+text is absent), info trimming, process-group termination on a synthesis
+timeout, the `speak --stop` fallback for a provider that escaped via `setsid`,
+and a real ephemeral-port server thread shut down from
+`addCleanup(self.stop_server)`.
+
 ## Deliberate design changes
 
 - Every QML file accesses the shell's theme singleton through a qualified
@@ -137,10 +227,15 @@ their output can change server-side under the same voice id.
 5. `bin/speak-voice` catalogue, verification, publication, and recovery
 6. `bin/speak-bindings` safety and coupled rollback behavior
 7. provider/OCR request construction, bounds, and error normalization
+8. `bin/speak-bridge` token/origin/body bounds and audio framing, then the
+   `chrome-extension/` service-worker message boundary and content-script
+   range mapping
 
 Run `python3 -m unittest discover -s tests -v` and the ShellCheck command from
-the README. The suite includes static QML interaction contracts; a full visual
-review still requires omarchy-shell.
+the README. For the extension, run `node --check` on every
+`chrome-extension/*.js` and `jq -e . chrome-extension/manifest.json`. The suite
+includes static QML interaction contracts; a full visual review still requires
+omarchy-shell.
 
 ## Re-pinning Piper voices
 

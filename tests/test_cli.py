@@ -693,6 +693,41 @@ class CliConfigTests(unittest.TestCase):
         result = self.run_speak("--preview-text", "See https://example.com in 2s")
         self.assertEqual(result.stdout, "See link in 2 seconds")
 
+    def test_browser_bridge_toggle_is_persisted_and_validated(self):
+        self.run_speak("--set", ".browser.enabled", "true")
+        info = json.loads(self.run_speak("--info").stdout)
+        self.assertTrue(info["browser"]["enabled"])
+        config = Path(self.temp.name, "omarchy-tts", "config.json")
+        self.assertTrue(json.loads(config.read_text())["browser"]["enabled"])
+        self.run_speak("--set", ".browser.enabled", "false")
+        self.assertFalse(json.loads(self.run_speak("--info").stdout)["browser"]["enabled"])
+        for bad in ("yes", "1", "True", ""):
+            result = self.run_speak("--set", ".browser.enabled", bad, check=False)
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_malformed_browser_object_is_normalized_not_fatal(self):
+        config = Path(self.temp.name, "omarchy-tts", "config.json")
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps({"browser": {"enabled": "banana"}}))
+        self.run_speak("--info")
+        settings = json.loads(config.read_text())
+        self.assertEqual(settings["browser"], {"enabled": False})
+
+    def test_restored_tab_can_reach_the_browser_tab(self):
+        self.run_speak("--set", ".ui.lastTab", "6")
+        self.assertEqual(json.loads(self.run_speak("--info").stdout)["ui"]["lastTab"], 6)
+        result = self.run_speak("--set", ".ui.lastTab", "7", check=False)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_info_never_carries_the_browser_token(self):
+        token_path = Path(self.temp.name, "omarchy-tts", "browser-token")
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        token_path.write_text("secret-browser-token-value\n")
+        self.run_speak("--set", ".browser.enabled", "true")
+        info = self.run_speak("--info").stdout
+        self.assertNotIn("secret-browser-token-value", info)
+        self.assertNotIn("token", json.loads(info)["browser"])
+
     def test_binding_manager_owns_only_its_marked_block(self):
         hypr = Path(self.temp.name, "hypr")
         hypr.mkdir()

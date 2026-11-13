@@ -25,6 +25,18 @@ play_raw() {
   [[ "$ch" =~ ^[0-9]+$ && "$ch" -ge 1 && "$ch" -le 8 ]] || {
     echo "speak: invalid raw-audio channel count" >&2; return 65;
   }
+  # Audio-out is an additional sink used by the browser bridge. It takes
+  # precedence over silence so a caller can capture the exact PCM stream.
+  if [[ -n "${TTS_AUDIO_OUT:-}" ]]; then
+    [[ -n "${TTS_AUDIO_META:-}" ]] || {
+      echo "speak: audio metadata path is not set" >&2; return 65;
+    }
+    printf '{"format":"pcm-s16le","rate":%s,"channels":%s}\n' "$rate" "$ch" \
+      > "$TTS_AUDIO_META" || {
+      echo "speak: could not write audio metadata" >&2; return 65;
+    }
+    exec cat > "$TTS_AUDIO_OUT"
+  fi
   # Verification drives a provider end to end; it must not be audible.
   if [[ "${TTS_SILENT:-0}" == "1" ]]; then exec cat > /dev/null; fi
 
@@ -44,6 +56,14 @@ play_file() {
   [[ -f "$f" && -s "$f" ]] || {
     echo "speak: audio file is missing or empty" >&2; return 65;
   }
+  if [[ -n "${TTS_AUDIO_OUT:-}" ]]; then
+    if [[ -n "${TTS_AUDIO_META:-}" ]]; then
+      printf '{"format":"file"}\n' > "$TTS_AUDIO_META" || {
+        echo "speak: could not write audio metadata" >&2; return 65;
+      }
+    fi
+    exec cat -- "$f" > "$TTS_AUDIO_OUT"
+  fi
   if [[ "${TTS_SILENT:-0}" == "1" ]]; then return 0; fi
   if command -v mpv >/dev/null 2>&1; then
     exec mpv --really-quiet --no-video --audio-display=no "$f"

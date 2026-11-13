@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.jhakeinson.tts",
   "name": "Text to Speech",
-  "version": "1.4.2",
+  "version": "1.5.0",
   "author": "jhakeinson",
   "license": "MIT",
   "description": "On-demand, local-first speech for selected text and anything visible on screen",

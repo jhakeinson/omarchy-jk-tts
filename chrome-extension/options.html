@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Omarchy TTS Reader settings</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main class="page">
+      <header class="head">
+        <div class="mark" aria-hidden="true">&#9654;</div>
+        <div>
+          <h1>Omarchy TTS Reader</h1>
+          <p class="sub">Pair the extension with the local Omarchy TTS bridge.</p>
+        </div>
+      </header>
+
+      <section class="card" aria-labelledby="pair-title">
+        <h2 id="pair-title">Bridge pairing</h2>
+
+        <form id="pairForm" novalidate>
+          <label class="field" for="bridgeUrl">
+            <span class="label">Bridge URL</span>
+            <input
+              id="bridgeUrl"
+              name="bridgeUrl"
+              type="url"
+              spellcheck="false"
+              autocomplete="off"
+              placeholder="http://127.0.0.1:8787"
+            />
+            <span class="hint">Only 127.0.0.1 is accepted.</span>
+          </label>
+
+          <label class="field" for="bridgeToken">
+            <span class="label">Token</span>
+            <span class="token-row">
+              <input
+                id="bridgeToken"
+                name="bridgeToken"
+                type="password"
+                spellcheck="false"
+                autocomplete="off"
+                placeholder="Paste the bridge token"
+              />
+              <button id="toggleToken" class="btn small" type="button" aria-pressed="false">
+                Show
+              </button>
+            </span>
+            <span class="hint">
+              Stored with <code>chrome.storage.local</code>; never sent anywhere
+              except the bridge on 127.0.0.1.
+            </span>
+          </label>
+
+          <div class="actions">
+            <button id="saveBtn" class="btn primary" type="submit">Save</button>
+            <button id="testBtn" class="btn" type="button">Test connection</button>
+          </div>
+        </form>
+
+        <p id="status" class="status" role="status" aria-live="polite" hidden></p>
+
+        <dl id="bridgeInfo" class="bridge-info" hidden>
+          <div><dt>Provider</dt><dd id="infoProvider">&mdash;</dd></div>
+          <div><dt>Voice</dt><dd id="infoVoice">&mdash;</dd></div>
+          <div><dt>Rate</dt><dd id="infoRate">&mdash;</dd></div>
+        </dl>
+      </section>
+
+      <section class="card" aria-labelledby="setup-title">
+        <h2 id="setup-title">Get the token</h2>
+        <p>
+          The easiest way is the plugin's settings panel: open the
+          <strong>TTS panel</strong> &rarr; <strong>Browser</strong> tab and
+          switch on <strong>Enable the browser bridge</strong>. The panel
+          starts the bridge as a user systemd service, shows the token, and
+          walks you through loading this extension.
+        </p>
+        <p>
+          From a terminal instead, start the bridge and print its pairing
+          token:
+        </p>
+        <pre><code>speak-bridge --print-token</code></pre>
+        <p>
+          Paste that token above. The same token is stored in
+          <code>${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-tts/browser-token</code>
+          with mode <code>0600</code>.
+        </p>
+        <p class="muted">
+          Run <code>speak-bridge --status</code> to check the service, or
+          <code>speak-bridge --install-service</code> to run it as a user
+          systemd service. <code>speak-bridge --disable</code> stops it and
+          keeps it from starting at boot. The bridge binds
+          <code>127.0.0.1</code> only.
+        </p>
+      </section>
+
+      <section class="card" aria-labelledby="usage-title">
+        <h2 id="usage-title">Using the reader</h2>
+        <ul class="usage">
+          <li>Select text on a normal web page and press <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>E</kbd>.</li>
+          <li>Right-click a selection and choose <strong>Read selection aloud</strong>.</li>
+          <li>Press the toolbar button, or <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd>, for the popup.</li>
+          <li>Stop with <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd> or the HUD.</li>
+        </ul>
+        <p class="muted">
+          The HUD stays in the top frame, even when the selection is inside an
+          iframe. Chrome blocks browser pages, the Web Store, and its built-in
+          PDF viewer.
+        </p>
+      </section>
+    </main>
+
+    <script src="shared.js"></script>
+    <script src="options.js"></script>
+  </body>
+</html>

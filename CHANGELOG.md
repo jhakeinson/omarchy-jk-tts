@@ -5,6 +5,58 @@ Versioning.
 
 ## Unreleased
 
+### Added
+- The TTS panel's new **Browser** tab can enable and disable the Chrome
+  extension bridge. Enabling installs and starts the `omarchy-tts-bridge`
+  systemd user service (`speak-bridge --enable`); disabling stops it and
+  removes it from boot (`speak-bridge --disable`). While enabled, the tab
+  shows the live service status, the pairing token (with copy), and
+  step-by-step instructions for loading the `chrome-extension/` folder and
+  pairing it. The token is fetched only when that tab is used; `--info` never
+  carries it. `speak-bridge --status` now also reports whether the service is
+  enabled.
+- Pause/resume now works anywhere in a read, and the sentence walker honors
+  it: pausing while the next sentence is still being synthesized (or in the
+  gap between sentences) parks the walker at the pending sentence, and resume
+  continues exactly there without synthesizing it twice. Mid-sentence pauses
+  keep the audio position. Pause/resume is reachable from the HUD, the popup
+  (new Pause/Resume button), a new `Alt+Shift+P` shortcut, and a new
+  "Pause reading"/"Resume reading" context menu item whose label follows the
+  playback state.
+
+### Fixed
+- Long selections that span inline `<script>`/`<style>` content no longer read
+  base64 payloads aloud: the content script now skips text nodes that are not
+  being rendered (scripts, styles, templates, `display:none` elements), which
+  matches what the visible selection contains.
+
+## 1.0.0
+
+- Added an optional Chrome/Chromium reader for page selections. The MV3
+  extension in `chrome-extension/` reads with the plugin's configured provider,
+  voice and rate, plays the returned audio in the page, highlights the current
+  sentence, auto-scrolls it into view, prefetches the next chunk, and shows a
+  floating HUD with progress, pause/resume and stop. It adds context-menu
+  actions and `Alt+Shift+E` (read), `Alt+Shift+X` (stop) and `Alt+Shift+R`
+  (popup) shortcuts, an options page for the bridge URL and token, and a
+  one-read-at-a-time policy with a `▶` tab badge.
+- Added `bin/speak-bridge`, a Python 3.11+ stdlib HTTP bridge bound to
+  `127.0.0.1:8787`. It requires a bearer token stored mode 0600 at
+  `${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-tts/browser-token`, allows only
+  `chrome-extension://` origins (plus absent origins for CLI/tests), answers
+  Private Network Access
+  preflight, bounds bodies and text, and exposes health, info, synthesize and
+  stop. Synthesis runs through `bin/speak` under a global lock with a
+  temporary audio sink, returning WAV, MP3 or Ogg audio with `X-Tts-*`
+  metadata and never logging selected text. `--print-token`, `--rotate-token`,
+  `--status` and `--install-service` (systemd user unit) cover day-to-day
+  operation.
+- Added `lib/play.sh` audio-output mode: `TTS_AUDIO_OUT` writes engine audio to
+  a path and `TTS_AUDIO_META` records `pcm-s16le` (with rate/channels) or
+  `file`. It is an additional sink only; existing playback, caching, exit
+  status and `TTS_SILENT` verification are unchanged.
+- Bumped the plugin manifest to 1.5.0 for the browser bridge and extension.
+
 ## 1.4.2 - 2026-11-08
 
 - Rebranded the plugin id and QML module name to

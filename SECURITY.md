@@ -37,6 +37,31 @@ be owned by the current user and cannot be symlinks. Config symlink targets are
 preserved deliberately, dangling targets are rejected, and interrupted engine
 or voice replacement is recovered transactionally on the next operation.
 
+## Browser bridge
+
+`bin/speak-bridge` listens on `127.0.0.1` only (default port 8787) and requires
+`Authorization: Bearer <token>` on every `/v1/*` request. The token is 32 bytes
+from `secrets.token_urlsafe` in `${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-tts/browser-token` (parent
+directory 0700, file 0600); reads and writes refuse symlinks, replacement is
+atomic, and comparisons use `hmac.compare_digest`. `--rotate-token`
+invalidates the old value. The bridge rejects unknown methods with 405, accepts
+only an absent `Origin` (CLI/tests) or one beginning with
+`chrome-extension://`, and returns 403 for other web origins. It echoes the
+allowed origin, sends `Vary: Origin`, and answers Chrome's Private Network
+Access preflight with `Access-Control-Allow-Private-Network: true`; a web page
+therefore cannot use the endpoint even if it learns the port. Because extension
+IDs are not secret, the bearer token — not the origin check — is the
+authorization boundary, so treat it like a credential and rotate it if exposed.
+
+Request bodies are capped at 256 KiB and text at 20,000 characters. The bridge
+never logs selected text, request bodies or audio: logs contain method, path and
+status only, error responses carry a bounded human-readable message with at most
+~800 bytes of collapsed stderr, and temporary audio is removed after each
+request. There is no static file or directory-listing route. The bridge adds no
+new remote destination: local providers still run on-device, while an
+explicitly configured cloud provider receives selected text through `bin/speak`
+exactly as it does for desktop reads.
+
 ## Supply chain
 
 Everything the plugin installs after the initial `omarchy plugin add` is fixed
