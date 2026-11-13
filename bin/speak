@@ -816,6 +816,7 @@ emit_info() {
         announceCodeBlocks:($config.sanitizer.announceCodeBlocks // true),
         stripMarkdown:($config.sanitizer.stripMarkdown // true),
         expandUnits:($config.sanitizer.expandUnits // true)},
+      browser:{enabled:($config.browser.enabled // false)},
       ui:{lastTab:($config.ui.lastTab // 0),
         sampleText:($config.ui.sampleText // "Highlight any text and press the key. This is how it sounds right now.")}}'
 }

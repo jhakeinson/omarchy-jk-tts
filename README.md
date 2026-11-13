@@ -288,6 +288,16 @@ endpoints. Every `/v1/*` request needs a bearer token.
 
 ### Setup
 
+The simplest path is inside the desktop plugin: open the **TTS panel →
+Browser** tab and switch on **Enable the browser bridge**. That installs and
+starts the systemd user service, shows the pairing token, and lists the same
+steps below (including the `chrome-extension/` folder of the installed
+plugin). The panel's toggle writes the choice to the config
+(`browser.enabled`), and turning it off stops the service and keeps it from
+starting at boot.
+
+From a terminal instead:
+
 1. Start the bridge (or let systemd keep it running):
 
    ```bash
@@ -297,9 +307,11 @@ endpoints. Every `/v1/*` request needs a bearer token.
    ```
 
    Run `bin/speak-bridge` in the foreground instead if you prefer; use
-   `--status` to see whether it is up, `--rotate-token` to invalidate a leaked
-   token, `--print-token` to show the current one, and `--version` for the
-   bridge version. The token is stored mode 0600 at
+   `--status` to see whether it is up and enabled, `--enable` to install and
+   start the service, `--disable` to stop it and remove it from boot,
+   `--rotate-token` to invalidate a leaked token, `--print-token` to show the
+   current one, and `--version` for the bridge version. The token is stored
+   mode 0600 at
    `${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-tts/browser-token`.
 
 2. Load the extension unpacked: open `chrome://extensions`, enable **Developer

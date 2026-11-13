@@ -72,7 +72,15 @@
       <section class="card" aria-labelledby="setup-title">
         <h2 id="setup-title">Get the token</h2>
         <p>
-          Start the bridge, then print its pairing token in a terminal:
+          The easiest way is the plugin's settings panel: open the
+          <strong>TTS panel</strong> &rarr; <strong>Browser</strong> tab and
+          switch on <strong>Enable the browser bridge</strong>. The panel
+          starts the bridge as a user systemd service, shows the token, and
+          walks you through loading this extension.
+        </p>
+        <p>
+          From a terminal instead, start the bridge and print its pairing
+          token:
         </p>
         <pre><code>speak-bridge --print-token</code></pre>
         <p>
@@ -83,7 +91,9 @@
         <p class="muted">
           Run <code>speak-bridge --status</code> to check the service, or
           <code>speak-bridge --install-service</code> to run it as a user
-          systemd service. The bridge binds <code>127.0.0.1</code> only.
+          systemd service. <code>speak-bridge --disable</code> stops it and
+          keeps it from starting at boot. The bridge binds
+          <code>127.0.0.1</code> only.
         </p>
       </section>
 

@@ -51,6 +51,39 @@ Item {
     && Number(download.pid || 0) > 1 && String(download.processIdentity || "") !== ""
   signal actionFinished
 
+  // Browser bridge -----------------------------------------------------------
+  // `speak-bridge --status` answers both halves of the story: whether the
+  // user's systemd service is enabled at boot and whether it answers right
+  // now. The pairing token is fetched on demand, never in --info, so a
+  // settings read never carries a credential.
+  readonly property string bridgeBin: localPath(Qt.resolvedUrl("../bin/speak-bridge"))
+  property var bridge: ({ enabled: false, running: false, url: "http://127.0.0.1:8787" })
+  property bool bridgeChecking: false
+  property string bridgeToken: ""
+  property string pendingBridgeCopy: ""
+
+  function refreshBridge() {
+    if (bridgeStatusProc.running) return
+    bridgeChecking = true
+    bridgeStatusProc.running = true
+  }
+  function setBridgeEnabled(value) {
+    error = ""
+    // The config write records the choice across panel restarts; the CLI call
+    // installs or stops the user service. Both are idempotent.
+    setConfig(".browser.enabled", value)
+    action([bridgeBin, value ? "--enable" : "--disable"])
+  }
+  function revealBridgeToken() {
+    if (bridgeTokenProc.running) return
+    bridgeTokenProc.running = true
+  }
+  function copyBridgeToken() {
+    if (bridgeToken === "" || bridgeCopyProc.running) return
+    pendingBridgeCopy = bridgeToken
+    bridgeCopyProc.running = true
+  }
+
   function restart(process) { process.running = false; process.running = true }
 
   // `speak --info` takes about 200 ms. Restarting it while it is still
@@ -325,6 +358,8 @@ Item {
           if (result.ok === false) root.error = result.message || "The TTS action failed."
         } catch (e) {}
       }
+      // Bridge start/stop changes the live status that the Browser tab shows.
+      if (String(actionProc.command[0] || "") === root.bridgeBin) root.refreshBridge()
       root.refresh(); root.refreshBindings(); root.refreshSetup(); root.actionFinished()
     }
   }
@@ -561,6 +596,44 @@ Item {
       root.pendingKeyPurpose = "speech"
       root.refresh()
     }
+  }
+  Process {
+    id: bridgeStatusProc; command: [root.bridgeBin, "--status"]
+    stdout: StdioCollector { id: bridgeStatusStdout; waitForEnd: true }
+    stderr: StdioCollector { id: bridgeStatusStderr; waitForEnd: true }
+    onExited: function(exitCode, exitStatus) {
+      root.bridgeChecking = false
+      // A run this controller killed with restart() is not a result; the
+      // replacement run reports. Treating the kill as a failure painted
+      // "Could not read TTS setup status" over a working install.
+      if (exitStatus !== 0) return
+      // Not running still prints valid JSON and exits 1, so only an
+      // unparseable answer is a real failure.
+      var result = null
+      try { result = JSON.parse(String(bridgeStatusStdout.text || "")) } catch (e) {}
+      if (!result || typeof result.running !== "boolean" || typeof result.enabled !== "boolean") {
+        root.error = String(bridgeStatusStderr.text || "Could not check the browser bridge status.").trim()
+        return
+      }
+      root.bridge = result
+    }
+  }
+  Process {
+    id: bridgeTokenProc; command: [root.bridgeBin, "--print-token"]
+    stdout: StdioCollector { id: bridgeTokenStdout; waitForEnd: true }
+    stderr: StdioCollector { id: bridgeTokenStderr; waitForEnd: true }
+    onExited: function(exitCode, exitStatus) {
+      if (exitStatus !== 0) return
+      var token = String(bridgeTokenStdout.text || "").trim()
+      if (exitCode !== 0 || !token)
+        root.error = exitCode !== 0 ? String(bridgeTokenStderr.text || "Could not read the bridge token.").trim()
+                                    : "The bridge token file is empty."
+      else root.bridgeToken = token
+    }
+  }
+  Process {
+    id: bridgeCopyProc; command: ["wl-copy"]; stdinEnabled: true
+    onStarted: { write(root.pendingBridgeCopy); root.pendingBridgeCopy = "" }
   }
   Timer { id: downloadPoll; interval: 1000; repeat: true; running: false; onTriggered: if (!downloadStatusProc.running) downloadStatusProc.running = true }
   Timer { id: setupJobPoll; interval: 1200; repeat: true; running: false; onTriggered: if (!setupJobProc.running) setupJobProc.running = true }

@@ -6,6 +6,15 @@ Versioning.
 ## Unreleased
 
 ### Added
+- The TTS panel's new **Browser** tab can enable and disable the Chrome
+  extension bridge. Enabling installs and starts the `omarchy-tts-bridge`
+  systemd user service (`speak-bridge --enable`); disabling stops it and
+  removes it from boot (`speak-bridge --disable`). While enabled, the tab
+  shows the live service status, the pairing token (with copy), and
+  step-by-step instructions for loading the `chrome-extension/` folder and
+  pairing it. The token is fetched only when that tab is used; `--info` never
+  carries it. `speak-bridge --status` now also reports whether the service is
+  enabled.
 - Pause/resume now works anywhere in a read, and the sentence walker honors
   it: pausing while the next sentence is still being synthesized (or in the
   gap between sentences) parks the walker at the pending sentence, and resume

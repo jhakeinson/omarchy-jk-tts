@@ -812,18 +812,18 @@ def _systemd_quote(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def install_service(host: str, port: int) -> int:
-    token = ensure_token()
+def service_unit_path() -> Path:
     service_dir = Path(os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")) / "systemd" / "user"
-    try:
-        service_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        print(f"speak-bridge: cannot create {service_dir}: {exc}", file=sys.stderr)
-        return 1
+    return service_dir / "omarchy-tts-bridge.service"
 
-    service_path = service_dir / "omarchy-tts-bridge.service"
-    python = _systemd_quote(sys.executable)
-    bridge = _systemd_quote(str(Path(__file__).resolve()))
+
+def write_service_unit(host: str, port: int) -> Path:
+    """Write the user service unit, creating its directory. Returns the path."""
+    service_path = service_unit_path()
+    try:
+        service_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise BridgeError(1, "install_failed", f"cannot create {service_path.parent}: {exc}")
     unit = (
         "[Unit]\n"
         "Description=Omarchy TTS browser bridge\n"
@@ -831,7 +831,8 @@ def install_service(host: str, port: int) -> int:
         "\n"
         "[Service]\n"
         "Type=simple\n"
-        f"ExecStart={python} {bridge} --host {host} --port {port}\n"
+        f"ExecStart={_systemd_quote(sys.executable)} {_systemd_quote(str(Path(__file__).resolve()))}"
+        f" --host {host} --port {port}\n"
         "Restart=on-failure\n"
         "RestartSec=2\n"
         "\n"
@@ -843,44 +844,86 @@ def install_service(host: str, port: int) -> int:
             handle.write(unit)
         os.chmod(service_path, 0o644)
     except OSError as exc:
-        print(f"speak-bridge: cannot write {service_path}: {exc}", file=sys.stderr)
+        raise BridgeError(1, "install_failed", f"cannot write {service_path}: {exc}")
+    return service_path
+
+
+def _systemctl(*args: str) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(["systemctl", "--user", *args], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise BridgeError(1, "systemctl_failed", f"systemctl --user {' '.join(args)} failed: {exc}")
+
+
+def enable_service(host: str, port: int) -> dict:
+    """Install (or refresh) the unit and start it with systemd. Returns a payload."""
+    ensure_token()
+    write_service_unit(host, port)
+    _systemctl("daemon-reload")
+    _systemctl("enable", "--now", "omarchy-tts-bridge.service")
+    url = f"http://{host}:{port}"
+    print(json.dumps({"ok": True, "url": url}, separators=(",", ":")))
+    return {"ok": True, "url": url}
+
+
+def disable_service() -> dict:
+    """Stop the bridge and keep it from starting at boot. Idempotent."""
+    unit = "omarchy-tts-bridge.service"
+    stop = _systemctl("stop", unit)
+    if stop.returncode != 0 and "not loaded" not in stop.stderr.decode("utf-8", "replace").lower():
+        raise BridgeError(1, "systemctl_failed",
+                          f"systemctl --user stop failed: {stop.stderr.decode('utf-8', 'replace').strip()}")
+    disable = _systemctl("disable", unit)
+    message = disable.stderr.decode("utf-8", "replace").lower()
+    if disable.returncode != 0 and not ("not found" in message or "does not exist" in message
+                                        or "no unit file" in message or "not loaded" in message):
+        raise BridgeError(1, "systemctl_failed",
+                          f"systemctl --user disable failed: {disable.stderr.decode('utf-8', 'replace').strip()}")
+    print(json.dumps({"ok": True}, separators=(",", ":")))
+    return {"ok": True}
+
+
+def install_service(host: str, port: int) -> int:
+    token = ensure_token()
+    try:
+        enable_service(host, port)
+    except BridgeError as exc:
+        print(f"speak-bridge: {exc.message}", file=sys.stderr)
         return 1
 
-    for command in (
-        ["systemctl", "--user", "daemon-reload"],
-        ["systemctl", "--user", "enable", "--now", "omarchy-tts-bridge.service"],
-    ):
-        try:
-            result = subprocess.run(command, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, timeout=30)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            print(f"speak-bridge: {' '.join(command)} failed: {exc}", file=sys.stderr)
-            return 1
-        if result.returncode != 0:
-            detail = result.stderr.decode("utf-8", "replace").strip()
-            print(f"speak-bridge: {' '.join(command)} failed: {detail}", file=sys.stderr)
-            return 1
-
-    print(f"Installed {service_path}")
+    print(f"Installed {service_unit_path()}")
     print(f"Bridge token: {token}")
     print("Paste this token into the extension options, then click Test connection.")
     return 0
 
 
+def service_enabled() -> bool:
+    """True when systemd has the bridge unit enabled at boot."""
+    try:
+        result = _systemctl("is-enabled", "omarchy-tts-bridge.service")
+    except BridgeError:
+        return False
+    return result.returncode == 0
+
+
 def report_status(host: str, port: int) -> int:
     url = f"http://{host}:{port}/v1/health"
     token = read_token()
+    enabled = service_enabled()
     if not token:
-        print(json.dumps({"running": False, "url": url, "reason": "token missing"}))
+        print(json.dumps({"running": False, "enabled": enabled, "url": url,
+                          "reason": "token missing"}))
         return 1
     request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
     try:
         with urllib.request.urlopen(request, timeout=3) as response:
             payload = json.loads(response.read().decode("utf-8"))
-        print(json.dumps({"running": True, "url": url, "health": payload}, separators=(",", ":")))
+        print(json.dumps({"running": True, "enabled": enabled, "url": url,
+                          "health": payload}, separators=(",", ":")))
         return 0
     except (urllib.error.URLError, OSError, ValueError):
-        print(json.dumps({"running": False, "url": url}))
+        print(json.dumps({"running": False, "enabled": enabled, "url": url}))
         return 1
 
 
@@ -897,6 +940,10 @@ def parse_args(argv=None):
     actions.add_argument("--print-token", action="store_true")
     actions.add_argument("--rotate-token", action="store_true")
     actions.add_argument("--status", action="store_true")
+    actions.add_argument("--enable", action="store_true",
+                         help="install and start the bridge as a user systemd service")
+    actions.add_argument("--disable", action="store_true",
+                         help="stop the bridge and disable its systemd service")
     actions.add_argument("--install-service", action="store_true")
     return parser.parse_args(argv)
 
@@ -919,6 +966,16 @@ def _run(args) -> int:
         return 0
     if args.status:
         return report_status(args.host, args.port)
+    try:
+        if args.enable:
+            enable_service(args.host, args.port)
+            return 0
+        if args.disable:
+            disable_service()
+            return 0
+    except BridgeError as exc:
+        print(f"speak-bridge: {exc.message}", file=sys.stderr)
+        return 1
     if args.install_service:
         return install_service(args.host, args.port)
 

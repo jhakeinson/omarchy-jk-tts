@@ -3,6 +3,8 @@
 
 import importlib.machinery
 import importlib.util
+import contextlib
+import io
 import json
 import os
 import socket
@@ -562,6 +564,115 @@ class BridgeTests(unittest.TestCase):
     def test_unknown_method_is_405(self):
         status, _headers, _body = self.request("PUT", "/v1/health")
         self.assertEqual(status, 405)
+
+
+class BridgeCliTests(unittest.TestCase):
+    """The panel drives the bridge through --enable/--disable/--status."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        patcher = mock.patch.dict(
+            os.environ, {"XDG_CONFIG_HOME": self.temp.name, "XDG_RUNTIME_DIR": self.temp.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_cli(self, argv, systemctl_results=None, patch_urlopen=False):
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(args)
+            for pattern, result in (systemctl_results or {}):
+                if all(part in args for part in pattern):
+                    return subprocess.CompletedProcess(args, *result)
+            return subprocess.CompletedProcess(args, 0, b"", b"")
+
+        patches = [mock.patch.object(BRIDGE_MODULE.subprocess, "run", fake_run)]
+        if patch_urlopen:
+            patches.append(mock.patch.object(
+                BRIDGE_MODULE.urllib.request, "urlopen",
+                mock.Mock(side_effect=urllib.error.URLError("connection refused"))))
+        for patcher in patches:
+            patcher.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = BRIDGE_MODULE.main(argv)
+        return code, stdout.getvalue(), stderr.getvalue(), calls
+
+    def test_enable_installs_the_unit_and_starts_the_service(self):
+        code, out, err, calls = self.run_cli(["--enable"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["ok"], True)
+        self.assertEqual(json.loads(out)["url"], "http://127.0.0.1:8787")
+        unit = Path(self.temp.name) / "systemd" / "user" / "omarchy-tts-bridge.service"
+        self.assertTrue(unit.is_file())
+        unit_text = unit.read_text(encoding="utf-8")
+        self.assertIn("ExecStart=", unit_text)
+        self.assertIn("speak-bridge", unit_text)
+        self.assertEqual(calls[0], ["systemctl", "--user", "daemon-reload"])
+        self.assertEqual(calls[1],
+                         ["systemctl", "--user", "enable", "--now",
+                          "omarchy-tts-bridge.service"])
+        token = Path(self.temp.name) / "omarchy-tts" / "browser-token"
+        self.assertTrue(token.is_file())
+        self.assertEqual(token.stat().st_mode & 0o777, 0o600)
+
+    def test_enable_reports_a_failure_without_starting_a_half_service(self):
+        blocked = Path(self.temp.name) / "blocked"
+        blocked.write_text("not a directory", encoding="utf-8")
+        os.environ["XDG_CONFIG_HOME"] = str(blocked)
+        code, out, err, _calls = self.run_cli(["--enable"])
+        self.assertEqual(code, 1)
+        self.assertNotIn('"ok"', out)
+        self.assertIn("speak-bridge:", err)
+
+    def test_disable_is_idempotent_for_a_unit_that_is_gone(self):
+        results = [(("stop",), (1, b"", b"Unit omarchy-tts-bridge.service not loaded.")),
+                   (("disable",), (1, b"",
+                                   "Failed to disable unit: Unit file"
+                                   " omarchy-tts-bridge.service does not exist.\n".encode()))]
+        code, out, err, calls = self.run_cli(["--disable"], systemctl_results=results)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out), {"ok": True})
+        self.assertIn(["systemctl", "--user", "stop", "omarchy-tts-bridge.service"], calls)
+        self.assertIn(["systemctl", "--user", "disable", "omarchy-tts-bridge.service"], calls)
+
+    def test_disable_reports_a_real_systemd_failure(self):
+        results = [(("stop",), (1, b"", b"systemd not running."))]
+        code, out, err, _calls = self.run_cli(["--disable"], systemctl_results=results)
+        self.assertEqual(code, 1)
+        self.assertNotIn('"ok"', out)
+        self.assertIn("systemd not running", err)
+
+    def test_status_reports_the_enabled_state_even_when_down(self):
+        token_path = Path(self.temp.name, "omarchy-tts", "browser-token")
+        token_path.parent.mkdir(parents=True)
+        token_path.write_text("tok\n", encoding="utf-8")
+        results = [(("is-enabled",), (0, b"enabled\n", b""))]
+        code, out, _err, _calls = self.run_cli(["--status"], systemctl_results=results,
+                                               patch_urlopen=True)
+        self.assertEqual(code, 1)
+        payload = json.loads(out)
+        self.assertFalse(payload["running"])
+        self.assertTrue(payload["enabled"])
+
+    def test_status_when_the_service_is_running(self):
+        token_path = Path(self.temp.name, "omarchy-tts", "browser-token")
+        token_path.parent.mkdir(parents=True)
+        token_path.write_text("tok\n", encoding="utf-8")
+        results = [(("is-enabled",), (0, b"enabled\n", b""))]
+        # report_status reaches the bridge itself; stand in for a healthy one.
+        response = io.BytesIO(json.dumps({"ok": True}).encode("utf-8"))
+        with mock.patch.object(BRIDGE_MODULE.urllib.request, "urlopen",
+                               mock.Mock(return_value=response)):
+            code, out, _err, _calls = self.run_cli(["--status"],
+                                                   systemctl_results=results)
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertTrue(payload["running"])
+        self.assertTrue(payload["enabled"])
+        self.assertEqual(payload["health"], {"ok": True})
 
 
 if __name__ == "__main__":

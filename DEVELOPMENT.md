@@ -1,7 +1,7 @@
 # Architecture and review guide
 
-The plugin has a six-tab settings panel: Provider, Voice, Text, Screen,
-Languages, and Keys. Its command-line boundary remains independently useful
+The plugin has a seven-tab settings panel: Provider, Voice, Text, Screen,
+Languages, Keys, and Browser. Its command-line boundary remains independently useful
 and testable.
 
 ## Ownership boundaries
@@ -18,7 +18,8 @@ and testable.
   verification path.
 - `bin/speak-bridge` owns the loopback HTTP bridge for the browser extension:
   token lifecycle, origin checks, request bounds, one-at-a-time synthesis
-  through `bin/speak`, and audio container framing. It never implements a
+  through `bin/speak`, and audio container framing, plus the lifecycle of its
+  systemd user service (`--enable`/`--disable`). It never implements a
   provider or resolves `speak` from `PATH`.
 - `chrome-extension/` owns the Manifest V3 reader: page-selection capture,
   chunking and DOM offset mapping, the Shadow DOM HUD, highlighting and
