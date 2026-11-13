@@ -1347,7 +1347,7 @@ Panel {
               width: parent.width
               text: controller.bridgeToken
               placeholderText: "Loading the pairing token…"
-              readOnly: true; selectByMouse: true; selectAllOnFocus: true
+              readOnly: true; selectByMouse: true
               foreground: root.fg; maximumLength: 128
               font.family: root.ff; font.pixelSize: Style.font.caption
             }
