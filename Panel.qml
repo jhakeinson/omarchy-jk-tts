@@ -55,7 +55,10 @@ Panel {
   // The toggle records the choice in the config; the service state is read
   // separately from `speak-bridge --status`.
   readonly property bool bridgeEnabled: controller.info.browser?.enabled === true
-  readonly property string extensionPath: controller.localPath(Qt.resolvedUrl(".")) + "/chrome-extension"
+  // localPath keeps the trailing slash of the resolved directory URL, which
+  // would paint the install path as "...tts//chrome-extension".
+  readonly property string extensionPath:
+    String(controller.localPath(Qt.resolvedUrl("."))).replace(/\/+$/, "") + "/chrome-extension"
   function toggleBridge(value) {
     controller.setBridgeEnabled(value)
     if (value) controller.revealBridgeToken()
@@ -369,6 +372,10 @@ Panel {
       restorePending = true
       controller.refresh(); controller.refreshBindings(); controller.refreshSetup(); controller.refreshDownload()
       controller.refreshBridge()
+      // A re-summon keeps the previous currentTab, so no change signal will
+      // fire - and the close handler emptied the token, so a hidden Browser
+      // tab must be re-fed here. callLater lets restoreFromInfo settle first.
+      Qt.callLater(root.maybeRevealBridgeToken)
     } else {
       // Never retain a pasted credential in a hidden, persistent panel.
       apiProvider = ""; apiVendor = ""
@@ -383,6 +390,9 @@ Panel {
     currentTab = Math.max(0, Math.min(6, Number(controller.info.ui?.lastTab || 0)))
     sampleText = String(controller.info.ui?.sampleText || sampleText)
     controller.previewText(previewSource)
+    // Info just landed: if it says the bridge is on while we already sit on
+    // the Browser tab, the change signal for currentTab never fires.
+    root.maybeRevealBridgeToken()
   }
   Connections {
     target: controller
@@ -406,12 +416,16 @@ Panel {
       }
     }
   }
+  // The token belongs to the Browser tab: it is fetched only while that tab
+  // is in use with the bridge on, so no other view ever requests a
+  // credential, and a hidden panel never holds one.
+  function maybeRevealBridgeToken() {
+    if (opened && currentTab === 6 && root.bridgeEnabled && controller.bridgeToken === "")
+      controller.revealBridgeToken()
+  }
   onCurrentTabChanged: if (opened) {
     controller.setConfig(".ui.lastTab", currentTab)
-    // The token belongs to the Browser tab: fetch it when that tab is entered
-    // with the bridge on, so no other view ever requests a credential.
-    if (currentTab === 6 && root.bridgeEnabled && controller.bridgeToken === "")
-      controller.revealBridgeToken()
+    root.maybeRevealBridgeToken()
   }
 
   KeyboardPanel {
