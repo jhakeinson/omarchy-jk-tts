@@ -78,11 +78,12 @@ Item {
     if (bridgeTokenProc.running) return
     bridgeTokenProc.running = true
   }
-  function copyBridgeToken() {
-    if (bridgeToken === "" || bridgeCopyProc.running) return
-    pendingBridgeCopy = bridgeToken
+  function copyText(text) {
+    if (String(text) === "" || bridgeCopyProc.running) return
+    pendingBridgeCopy = String(text)
     bridgeCopyProc.running = true
   }
+  function copyBridgeToken() { copyText(bridgeToken) }
 
   function restart(process) { process.running = false; process.running = true }
 

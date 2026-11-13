@@ -59,6 +59,19 @@ Panel {
   // would paint the install path as "...tts//chrome-extension".
   readonly property string extensionPath:
     String(controller.localPath(Qt.resolvedUrl("."))).replace(/\/+$/, "") + "/chrome-extension"
+  // The install path is long and mid-elided, so it is click-to-copy; the
+  // notice is transient because a hidden panel must not keep stale UI text.
+  property string pathCopiedNotice: ""
+  Timer {
+    id: pathCopiedReset
+    interval: 2500; repeat: false
+    onTriggered: root.pathCopiedNotice = ""
+  }
+  function copyExtensionPath() {
+    controller.copyText(root.extensionPath)
+    root.pathCopiedNotice = "Folder path copied. Paste it into “Load unpacked”."
+    pathCopiedReset.restart()
+  }
   function toggleBridge(value) {
     controller.setBridgeEnabled(value)
     if (value) controller.revealBridgeToken()
@@ -1369,10 +1382,39 @@ Panel {
               width: parent.width; spacing: 2
               Text { width: parent.width; text: "Install the reader extension:"; color: root.fg; font.family: root.ff; font.pixelSize: Style.font.caption }
               Text { width: parent.width; wrapMode: Text.WordWrap; text: "1. Open chrome://extensions and turn on Developer mode."; color: root.dim; font.family: root.ff; font.pixelSize: Style.font.caption }
-              Text { width: parent.width; wrapMode: Text.WordWrap; text: "2. Click “Load unpacked” and choose this folder:"; color: root.dim; font.family: root.ff; font.pixelSize: Style.font.caption }
-              Text { width: parent.width; elide: Text.ElideMiddle; textFormat: Text.PlainText
-                     text: root.extensionPath; color: root.fg
-                     font.family: root.ff; font.pixelSize: Style.font.caption }
+              Text { width: parent.width; wrapMode: Text.WordWrap; text: "2. Click “Load unpacked” and choose this folder (click the path to copy it):"; color: root.dim; font.family: root.ff; font.pixelSize: Style.font.caption }
+              Item {
+                id: pathRow
+                width: parent.width
+                height: pathText.implicitHeight
+                activeFocusOnTab: true
+                Accessible.role: Accessible.Button
+                Accessible.name: "Copy the extension folder path: " + root.extensionPath
+                Accessible.onPressAction: root.copyExtensionPath()
+                Keys.onSpacePressed: root.copyExtensionPath()
+                Keys.onReturnPressed: root.copyExtensionPath()
+                Keys.onEnterPressed: root.copyExtensionPath()
+                Text {
+                  id: pathText
+                  width: parent.width; elide: Text.ElideMiddle; textFormat: Text.PlainText
+                  text: root.extensionPath
+                  color: pathRow.activeFocus || pathMouse.containsMouse || root.pathCopiedNotice !== "" ? Commons.Color.accent : root.fg
+                  font.family: root.ff; font.pixelSize: Style.font.caption
+                }
+                MouseArea {
+                  id: pathMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.copyExtensionPath()
+                }
+              }
+              Text {
+                width: parent.width; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                visible: root.pathCopiedNotice !== ""
+                text: root.pathCopiedNotice
+                color: Commons.Color.accent; font.family: root.ff; font.pixelSize: Style.font.caption
+              }
               Text { width: parent.width; wrapMode: Text.WordWrap
                      text: "3. Open the reader's Options, paste the token above, leave the bridge URL at http://127.0.0.1:8787, and click “Test connection”."
                      color: root.dim; font.family: root.ff; font.pixelSize: Style.font.caption }

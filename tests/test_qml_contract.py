@@ -55,6 +55,17 @@ class QmlContractTests(unittest.TestCase):
         self.assertIn('setConfig(".browser.enabled", value)', self.controller)
         self.assertIn('bridgeBin, value ? "--enable" : "--disable"', self.controller)
 
+    def test_extension_path_is_click_to_copy(self):
+        # The install path is mid-elided, so it must be copyable whole with
+        # one interaction, from mouse and keyboard alike.
+        self.assertIn("function copyText(text)", self.controller)
+        self.assertIn("function copyExtensionPath()", self.panel)
+        self.assertIn("controller.copyText(root.extensionPath)", self.panel)
+        self.assertIn("Accessible.role: Accessible.Button", self.panel)
+        self.assertIn("Keys.onSpacePressed: root.copyExtensionPath()", self.panel)
+        self.assertIn("cursorShape: Qt.PointingHandCursor", self.panel)
+        self.assertIn("pathCopiedNotice", self.panel)
+
     def test_bridge_token_is_fetched_on_demand_and_never_retained(self):
         # The token is requested only while the Browser tab is in use, and a
         # hidden panel never keeps it. --info (tested in test_cli.py) never
