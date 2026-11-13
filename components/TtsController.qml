@@ -287,8 +287,11 @@ Item {
           var result = JSON.parse(String(infoStdout.text || ""))
           if (!result || typeof result !== "object" || !Array.isArray(result.providers))
             throw new Error("invalid settings response")
-          root.info = result
+          // Flag first: assigning info fires its change signal synchronously,
+          // and a handler running at that point must see the loaded flag -
+          // otherwise the first read after opening restores from nothing.
           root.infoLoaded = true
+          root.info = result
         } catch (e) {
           root.error = "Could not read TTS settings."
         }
