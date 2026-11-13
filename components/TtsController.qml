@@ -60,7 +60,6 @@ Item {
   property var bridge: ({ enabled: false, running: false, url: "http://127.0.0.1:8787" })
   property bool bridgeChecking: false
   property string bridgeToken: ""
-  property string pendingBridgeCopy: ""
 
   function refreshBridge() {
     if (bridgeStatusProc.running) return
@@ -80,7 +79,10 @@ Item {
   }
   function copyText(text) {
     if (String(text) === "" || bridgeCopyProc.running) return
-    pendingBridgeCopy = String(text)
+    // wl-copy never sees an EOF on a persistent stdin pipe, so it would wait
+    // forever and publish nothing. Pass the text as an argument instead;
+    // wl-copy daemonizes on its own after claiming the clipboard.
+    bridgeCopyProc.command = ["wl-copy", String(text)]
     bridgeCopyProc.running = true
   }
   function copyBridgeToken() { copyText(bridgeToken) }
@@ -636,8 +638,7 @@ Item {
     }
   }
   Process {
-    id: bridgeCopyProc; command: ["wl-copy"]; stdinEnabled: true
-    onStarted: { write(root.pendingBridgeCopy); root.pendingBridgeCopy = "" }
+    id: bridgeCopyProc; command: []
   }
   Timer { id: downloadPoll; interval: 1000; repeat: true; running: false; onTriggered: if (!downloadStatusProc.running) downloadStatusProc.running = true }
   Timer { id: setupJobPoll; interval: 1200; repeat: true; running: false; onTriggered: if (!setupJobProc.running) setupJobProc.running = true }
