@@ -3,32 +3,50 @@
 All notable changes are documented here. This project follows Semantic
 Versioning.
 
-## Unreleased
+## 1.5.0 - 2026-11-13
 
 ### Added
-- The TTS panel's new **Browser** tab can enable and disable the Chrome
-  extension bridge. Enabling installs and starts the `omarchy-tts-bridge`
-  systemd user service (`speak-bridge --enable`); disabling stops it and
-  removes it from boot (`speak-bridge --disable`). While enabled, the tab
-  shows the live service status, the pairing token (with copy), and
-  step-by-step instructions for loading the `chrome-extension/` folder and
-  pairing it. The token is fetched only when that tab is used; `--info` never
-  carries it. `speak-bridge --status` now also reports whether the service is
-  enabled.
-- Pause/resume now works anywhere in a read, and the sentence walker honors
-  it: pausing while the next sentence is still being synthesized (or in the
-  gap between sentences) parks the walker at the pending sentence, and resume
-  continues exactly there without synthesizing it twice. Mid-sentence pauses
-  keep the audio position. Pause/resume is reachable from the HUD, the popup
-  (new Pause/Resume button), a new `Alt+Shift+P` shortcut, and a new
-  "Pause reading"/"Resume reading" context menu item whose label follows the
-  playback state.
+- **Browser tab.** Read page selections from Chrome/Chromium via the new MV3
+  extension in `chrome-extension/`: speech from your configured provider,
+  current-sentence highlighting, auto-scroll, prefetching, and a floating HUD
+  with progress, pause/resume and stop. The panel's Browser tab enables and
+  disables the `omarchy-tts-bridge` systemd user service, shows live status,
+  and copies the pairing token.
+- **Bridge.** `bin/speak-bridge` — a Python stdlib HTTP server on `127.0.0.1`
+  with bearer-token auth, `chrome-extension://` origin allowlisting, Private
+  Network Access preflight, bounded request bodies and text, WAV/MP3/Ogg
+  output, `X-Tts-*` metadata, and never logging selected text.
+- Pause/resume anywhere in a read (HUD, popup, `Alt+Shift+P`, context menu)
+  that parks the sentence walker and continues exactly there without
+  re-synthesizing.
+- Shortcuts `Alt+Shift+E` (read), `Alt+Shift+X` (stop), `Alt+Shift+P`
+  (pause/resume), `Alt+Shift+R` (popup); context-menu actions for read/stop/
+  pause/resume.
+- `bin/speak-bridge --install-service` installs and starts a systemd user
+  unit; `--status`, `--enable`, `--disable`, `--rotate-token`, `--print-token`
+  and `--version` cover day-to-day operation.
 
 ### Fixed
 - Long selections that span inline `<script>`/`<style>` content no longer read
-  base64 payloads aloud: the content script now skips text nodes that are not
-  being rendered (scripts, styles, templates, `display:none` elements), which
-  matches what the visible selection contains.
+  base64 payloads aloud: the content script skips text nodes that are not
+  rendered (`display:none`, `visibility:hidden`,
+  `content-visibility:hidden`, scripts/styles/templates), matching the visible
+  selection.
+- Pause/resume races: an autoplay-blocked `play()` now keeps the pause intent
+  so the HUD Resume button retries instead of being a no-op; pausing while a
+  chunk is still synthesizing parks on that sentence rather than skipping it
+  or playing two chunks at once.
+- Selection highlighting no longer speaks text hidden with `visibility:
+  hidden` or `content-visibility: hidden`, and SVG `script`/`style` tags are
+  matched case-insensitively.
+
+### Infrastructure
+- New toolbar/store icons at 16/32/48/128 px, wired into `icons` and
+  `action.default_icon`.
+- Hardened systemd unit installation: `%` specifiers are escaped and the unit
+  is created with `O_NOFOLLOW`.
+- Synthesized audio is bounded by `PLUGIN_MAX_BYTES` before it is read into
+  memory.
 
 ## 1.0.0
 
