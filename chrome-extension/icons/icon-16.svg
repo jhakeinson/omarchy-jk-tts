@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <rect x="0" y="0" width="128" height="128" rx="24" fill="#18181b"/>
+  <!-- speaker driver -->
+  <rect x="22" y="46" width="22" height="36" rx="7" fill="#f97316"/>
+  <!-- speaker cone -->
+  <path d="M44 46 L76 22 L76 106 L44 82 Z" fill="#f97316"/>
+  <!-- single sound wave, thick enough to survive 16px -->
+  <path d="M86 44 A26 26 0 0 1 86 84" fill="none" stroke="#fdba74" stroke-width="11" stroke-linecap="round"/>
+</svg>
