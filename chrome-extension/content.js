@@ -78,12 +78,13 @@ const OmarchyTtsText = (function () {
    * is full of base64 payloads that the TTS engine would otherwise read
    * aloud, so only text nodes with a rendered ancestor may join the map.
    */
-  var UNRENDERED_TAGS = /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|HEAD)$/;
+  var UNRENDERED_TAGS = /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|HEAD)$/i;
 
   function isRenderedTextNode(node, cache) {
     var doc = node.ownerDocument;
     var element = node.parentElement;
     while (element && element !== doc.documentElement) {
+      /* SVG (and XML documents) lower-case tagName; match case-insensitively. */
       if (UNRENDERED_TAGS.test(element.tagName)) return false;
       if (cache) {
         if (cache.has(element)) {
@@ -93,7 +94,20 @@ const OmarchyTtsText = (function () {
           try {
             var view = doc.defaultView;
             var style = view && view.getComputedStyle(element);
-            rendered = !style || style.display !== 'none';
+            if (style) {
+              /*
+               * Selected text can intersect content the user cannot see.
+               * Skip hidden content, not just display:none, so payloads in
+               * collapsed/visibility-hidden containers are not spoken.
+               */
+              var contentVisibility =
+                style.contentVisibility || style.webkitContentVisibility;
+              rendered =
+                style.display !== 'none' &&
+                style.visibility !== 'hidden' &&
+                style.visibility !== 'collapse' &&
+                contentVisibility !== 'hidden';
+            }
           } catch (err) {
             /* Detached documents have no style; keep the node. */
           }
@@ -935,6 +949,9 @@ const OmarchyTtsText = (function () {
       return;
     }
 
+    var serial = (session.playSerial || 0) + 1;
+    session.playSerial = serial;
+
     if (session.paused) {
       /* Park the walker here; resumeReading continues from this chunk.
        * Point the position and highlight at the pending sentence, so the
@@ -946,6 +963,11 @@ const OmarchyTtsText = (function () {
       return;
     }
 
+    /* Record the sentence before awaiting synthesis. Pausing in that window
+     * must park on this chunk, not skip it; the serial makes an older walker
+     * bail if resume starts this chunk again while the first request is
+     * still in flight. */
+    session.pendingIndex = i;
     session.index = i;
     session.status = i === 0 ? 'preparing' : 'speaking';
     showChunk(i, gen);
@@ -958,10 +980,10 @@ const OmarchyTtsText = (function () {
     try {
       result = await synthesizeChunk(i, gen);
     } catch (err) {
-      if (isCurrent(gen)) failReading(err);
+      if (isCurrent(gen) && session.playSerial === serial) failReading(err);
       return;
     }
-    if (!isCurrent(gen) || !session) return;
+    if (!isCurrent(gen) || !session || session.playSerial !== serial) return;
 
     if (session.paused) {
       /* Pause landed while this chunk was being synthesized. Keep it cached
@@ -1041,7 +1063,12 @@ const OmarchyTtsText = (function () {
     try {
       await audio.play();
     } catch (err) {
-      if (!isCurrent(gen)) return;
+      if (!isCurrent(gen) || session.playSerial !== serial) return;
+      /* Keep the pause intent in sync with the reported state: the HUD's
+       * Resume button is driven by `status` but resumeReading() requires
+       * `paused`, so both must be set or the button is a no-op. */
+      session.paused = true;
+      session.pendingIndex = i;
       session.status = 'paused';
       sendCurrentState('paused', {
         message:
@@ -1050,8 +1077,9 @@ const OmarchyTtsText = (function () {
       return;
     }
 
-    if (!isCurrent(gen) || !session) return;
+    if (!isCurrent(gen) || !session || session.playSerial !== serial) return;
     if (applyPauseIfWanted(gen)) return;
+    session.pendingIndex = null;
     session.status = 'speaking';
     sendCurrentState('speaking', { progress: 0 });
     startTicker(gen);
@@ -1141,6 +1169,7 @@ const OmarchyTtsText = (function () {
       status: 'preparing',
       paused: false,
       pendingIndex: null,
+      playSerial: 0,
       provider: null,
       voice: null,
       rate: null,

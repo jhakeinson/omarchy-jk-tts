@@ -747,6 +747,17 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 raise BridgeError(502, "synthesis_failed", message)
 
             try:
+                size = audio_path.stat().st_size
+            except OSError:
+                size = 0
+            if size > PLUGIN_MAX_BYTES:
+                # Bound memory and response size before reading provider output.
+                raise BridgeError(
+                    502,
+                    "audio_too_large",
+                    "synthesized audio exceeds the bridge size limit",
+                )
+            try:
                 audio = audio_path.read_bytes()
             except OSError:
                 audio = b""
@@ -809,7 +820,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 def _systemd_quote(value: str) -> str:
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    # systemd expands % specifiers in unit files; doubling keeps literal paths.
+    escaped = value.replace("%", "%%")
+    return '"' + escaped.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def service_unit_path() -> Path:
@@ -840,7 +853,9 @@ def write_service_unit(host: str, port: int) -> Path:
         "WantedBy=default.target\n"
     )
     try:
-        with open(service_path, "w", encoding="utf-8") as handle:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(service_path, flags, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(unit)
         os.chmod(service_path, 0o644)
     except OSError as exc:
